@@ -1,0 +1,11 @@
+{
+  "base_dir": "G:/workbuddy/wechat_data/topic_search_downloads",
+  "search_pages": 2,
+  "download_delay": 1.0,
+  "cache_ttl_minutes": 30,
+  "sogou_cookies": "",
+  "ai_rerank": true,
+  "rerank_model": "",
+  "api_base": "",
+  "api_token": ""
+}
