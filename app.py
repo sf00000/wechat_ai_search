@@ -24,13 +24,14 @@ import tempfile
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QUrl
+from PySide6.QtCore import QThread, Signal, Qt, QEvent, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSpinBox, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QRadioButton, QSpinBox, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from search_channels import SearchResult, SogouCaptchaError, SogouWeixin, search_all
@@ -38,6 +39,7 @@ import downloader
 import rerank
 import version
 from cache_store import Store
+from summary_popup import SummaryCard
 
 APP_DIR = Path(__file__).resolve().parent
 if getattr(sys, "frozen", False):
@@ -387,10 +389,19 @@ class MainWindow(QMainWindow):
         self.rerank_worker: RerankWorker | None = None
         self.preview_worker: PreviewWorker | None = None
         self.preview_dlg = PreviewDialog(self)
+        self.summary_card = SummaryCard()
+        self.summary_card.viewArticleRequested.connect(self.start_preview)
+        self.summary_card.openInBrowserRequested.connect(
+            lambda r: QDesktopServices.openUrl(QUrl(r.sogou_link or r.url))
+        )
         self._results: list[SearchResult] = []   # 最近一次搜索的原始结果
+        self._results_by_key: dict[str, SearchResult] = {}  # 稳定 ID → 结果（勾选状态源）
+        self._checked_keys: set[str] = set()     # 已勾选的稳定 ID（跨筛选/排序保持）
         self._ai_scores: dict[str, int] = {}     # key -> AI 相关性分
         self._search_gen = 0                     # 搜索代数：丢弃过期查询的 AI 精排结果
+        self._sort_mode = "relevance"            # relevance / date_desc / date_asc
         self._closing = False
+        self._hover_key: str | None = None
         self._init_ui()
         self._init_shortcuts()
 
@@ -431,28 +442,39 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_search)
         layout.addLayout(bar)
 
-        # 筛选行（改动即时生效，不重新搜索）
-        flt = QHBoxLayout()
-        flt.addWidget(QLabel("时间:"))
-        self.combo_days = QComboBox()
-        self.combo_days.addItems(["全部时间", "近一周", "近一月", "近一年"])
-        flt.addWidget(self.combo_days)
-        flt.addWidget(QLabel("每号最多:"))
+        # 选择行：全选（三态显示）/ 清空选择，只作用于当前展示的结果
+        sel = QHBoxLayout()
+        self.chk_select_all = QCheckBox("全选当前结果")
+        self.chk_select_all.setTristate(True)  # 三态仅用于显示部分选中
+        self.chk_select_all.clicked.connect(self._on_select_all_clicked)
+        sel.addWidget(self.chk_select_all)
+        self.btn_clear_sel = QPushButton("清空选择")
+        self.btn_clear_sel.clicked.connect(self._on_clear_selection)
+        sel.addWidget(self.btn_clear_sel)
+        sel.addWidget(QLabel("时间:"))
+        self.radio_days: dict[int, QRadioButton] = {}
+        for value, label in ((0, "全部时间"), (7, "近一周"), (30, "近一月"), (365, "近一年")):
+            rb = QRadioButton(label)
+            rb.setChecked(value == 0)
+            rb.toggled.connect(self._render_results)
+            self.radio_days[value] = rb
+            sel.addWidget(rb)
+        sel.addWidget(QLabel("每号最多:"))
         self.spin_peracct = QSpinBox()
         self.spin_peracct.setRange(0, 20)
         self.spin_peracct.setValue(3)
         self.spin_peracct.setToolTip("每个公众号最多保留几篇，0=不限（防营销号刷屏）")
-        flt.addWidget(self.spin_peracct)
-        flt.addWidget(QLabel("包含词:"))
+        sel.addWidget(self.spin_peracct)
+        sel.addWidget(QLabel("包含词:"))
         self.input_include = QLineEdit()
         self.input_include.setPlaceholderText("任一命中保留")
         self.input_include.setFixedWidth(110)
-        flt.addWidget(self.input_include)
-        flt.addWidget(QLabel("排除词:"))
+        sel.addWidget(self.input_include)
+        sel.addWidget(QLabel("排除词:"))
         self.input_exclude = QLineEdit()
         self.input_exclude.setPlaceholderText("任一命中剔除")
         self.input_exclude.setFixedWidth(110)
-        flt.addWidget(self.input_exclude)
+        sel.addWidget(self.input_exclude)
         self.chk_ai = QCheckBox("AI 精排")
         self.chk_ai.setChecked(bool(self.cfg.get("ai_rerank", True)))
         if not rerank.gateway_available(
@@ -467,25 +489,31 @@ class MainWindow(QMainWindow):
             )
         else:
             self.chk_ai.setToolTip("把标题+摘要发给模型网关打相关性分，完成后自动重排（正文不出本机）")
-        flt.addWidget(self.chk_ai)
-        flt.addStretch(1)
-        layout.addLayout(flt)
+        sel.addWidget(self.chk_ai)
+        sel.addStretch(1)
+        layout.addLayout(sel)
 
-        # 结果表
+        # 结果表：勾选 / 标题 / 公众号 / 日期 / 相关度 / 下载状态（摘要进悬浮卡）
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(7)
-        self.tree.setHeaderLabels(["#", "标题", "公众号", "日期", "分", "状态", "摘要"])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["勾选", "标题", "公众号", "日期", "相关度", "下载状态"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setEditTriggers(QTreeWidget.NoEditTriggers)
+        self.tree.setStyleSheet("QTreeWidget::item { height: 44px; }")
+        self.tree.setMouseTracking(True)
+        self.tree.viewport().setAttribute(Qt.WA_Hover, True)
+        self.tree.viewport().installEventFilter(self)
         header = self.tree.header()
-        header.setSectionResizeMode(1, QHeaderView.Stretch)      # 标题拉伸
-        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)      # 标题独占剩余宽度
         self.tree.setColumnWidth(0, 44)
         self.tree.setColumnWidth(2, 110)
         self.tree.setColumnWidth(3, 90)
-        self.tree.setColumnWidth(4, 40)
+        self.tree.setColumnWidth(4, 64)
         self.tree.setColumnWidth(5, 150)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(4, Qt.DescendingOrder)  # 默认相关度排序
+        header.sectionClicked.connect(self._on_header_clicked)
         layout.addWidget(self.tree, 1)
 
         # 下载行
@@ -514,14 +542,13 @@ class MainWindow(QMainWindow):
         self.tree.itemDoubleClicked.connect(self.on_preview)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
-        # 筛选条件变化即时重渲染（不重新搜索）
-        self.combo_days.currentIndexChanged.connect(self._render_results)
+        # 筛选条件变化即时重渲染（不重新搜索）；时间单选在创建处已接 toggled
         self.spin_peracct.valueChanged.connect(self._render_results)
         self.input_include.textChanged.connect(self._render_results)
         self.input_exclude.textChanged.connect(self._render_results)
         self.chk_ai.toggled.connect(self._on_ai_toggled)
 
-        hint = QLabel("空格 勾选 · Ctrl+A 全选 · 回车 下载选中 · 双击 预览原文 · F5 强制刷新搜索")
+        hint = QLabel("空格 勾选 · Ctrl+A 全选当前 · 回车 下载选中 · 双击/悬浮卡 查看正文 · F5 强制刷新搜索")
         hint.setStyleSheet("color: #888;")
         layout.addWidget(hint)
 
@@ -570,6 +597,8 @@ class MainWindow(QMainWindow):
             SearchResult(**{k: v for k, v in d.items() if k in SearchResult.__dataclass_fields__})
             for d in results
         ]
+        self._results_by_key = {rerank.key(r): r for r in self._results}
+        self._checked_keys = set()  # 新查询：勾选从零开始
         self._ai_scores = {}
         self._render_results()
         # AI 精排：异步打分，完成后自动重排（不挡搜索/勾选/下载操作）。
@@ -595,59 +624,151 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ 渲染/筛选
 
-    def _days_from_combo(self) -> int | None:
-        return {0: None, 1: 7, 2: 30, 3: 365}.get(self.combo_days.currentIndex())
+    def _days_from_radio(self) -> int | None:
+        for value, rb in self.radio_days.items():
+            if rb.isChecked():
+                return value or None
+        return None
+
+    def _sort_scored(self, scored: list) -> None:
+        """按当前排序模式就地排序：relevance / date_desc / date_asc。
+
+        日期排序用标准化时间戳（publish_ts），无日期的结果两个方向都放最后。
+        """
+        if self._sort_mode in ("date_desc", "date_asc"):
+            def key(pair):
+                r, local = pair
+                if not r.publish_ts:
+                    return (1, 0, -local)
+                return (0, -r.publish_ts if self._sort_mode == "date_desc" else r.publish_ts, -local)
+            scored.sort(key=key)
+        else:
+            def key(pair):
+                r, local = pair
+                ai = self._ai_scores.get(rerank.key(r)) if self.chk_ai.isChecked() else None
+                return (-ai if ai is not None else 1 << 30, -local)
+            scored.sort(key=key)
+
+    def _score_cell(self, r: SearchResult) -> tuple[str, bool, bool]:
+        """相关度列 (文本, 绿色, 红色)。未评分显示待评分，不视为 0 分。"""
+        ai = self._ai_scores.get(rerank.key(r))
+        if ai is not None:
+            return str(ai), ai >= 7, ai <= 3
+        if self.chk_ai.isChecked() and self.chk_ai.isEnabled():
+            return "待评分", False, False
+        return "\u2014", False, False
 
     def _render_results(self):
-        """按当前筛选条件 + 相关度排序重建表格（保持勾选状态）。"""
+        """按当前筛选 + 排序重建表格。保留：勾选（稳定 ID 为源）、当前行、滚动位置。"""
         if not self._results:
             return
-        # 记住勾选状态（按结果稳定 key）
-        checked: set[str] = set()
-        for i in range(self.tree.topLevelItemCount()):
-            it = self.tree.topLevelItem(i)
-            if it.checkState(0) == Qt.Checked:
-                r: SearchResult = it.data(0, Qt.UserRole)
-                checked.add(rerank.key(r))
+        sb = self.tree.verticalScrollBar()
+        scroll_pos = sb.value()
+        cur = self.tree.currentItem()
+        cur_key = rerank.key(cur.data(0, Qt.UserRole)) if cur is not None else None
 
         query = self.input.text().strip()
         items = rerank.apply_filters(
             self._results,
-            days=self._days_from_combo(),
+            days=self._days_from_radio(),
             per_account=self.spin_peracct.value(),
             include=self.input_include.text(),
             exclude=self.input_exclude.text(),
         )
         scored = [(r, rerank.local_score(query, r)) for r in items]
-
-        def sort_key(pair):
-            r, local = pair
-            ai = self._ai_scores.get(rerank.key(r)) if self.chk_ai.isChecked() else None
-            return (-ai if ai is not None else 1 << 30, -local)  # 有 AI 分的排前，按分数降序
-
-        scored.sort(key=sort_key)
+        self._sort_scored(scored)
 
         self.tree.blockSignals(True)  # 重建期间不触发 itemChanged 刷计数
         self.tree.clear()
-        for i, (r, _local) in enumerate(scored, 1):
-            item = QTreeWidgetItem([str(i), r.title, r.account, r.date_str, "", "", r.snippet])
+        for r, _local in scored:
+            item = QTreeWidgetItem(["", r.title, r.account, r.date_str, "", ""])
             item.setData(0, Qt.UserRole, r)
-            item.setCheckState(0, Qt.Checked if rerank.key(r) in checked else Qt.Unchecked)
+            item.setCheckState(0, Qt.Checked if rerank.key(r) in self._checked_keys else Qt.Unchecked)
             item.setToolTip(1, r.title)
+            score_text, green, red = self._score_cell(r)
+            item.setText(4, score_text)
+            if green:
+                item.setForeground(4, Qt.darkGreen)
+            elif red:
+                item.setForeground(4, Qt.red)
             prev = self.store.get_download(r.url) if r.url else None
             if prev:
-                item.setText(5, "✓ 此前已下载")
+                item.setText(5, "\u2713 此前已下载")
                 item.setForeground(5, Qt.gray)
-            ai = self._ai_scores.get(rerank.key(r))
-            if ai is not None:
-                item.setText(4, str(ai))
-                if ai >= 7:
-                    item.setForeground(4, Qt.darkGreen)
-                elif ai <= 3:
-                    item.setForeground(4, Qt.red)
             self.tree.addTopLevelItem(item)
+        # 恢复当前行与滚动位置
+        if cur_key:
+            for i in range(self.tree.topLevelItemCount()):
+                it = self.tree.topLevelItem(i)
+                if rerank.key(it.data(0, Qt.UserRole)) == cur_key:
+                    self.tree.setCurrentItem(it)
+                    break
+        sb.setValue(scroll_pos)
         self.tree.blockSignals(False)
-        self._update_selected_count()
+        self._sync_selection_ui()
+
+    def _sync_selection_ui(self):
+        """同步全选框三态、已选计数（含隐藏）、下载按钮数量。"""
+        displayed = {
+            rerank.key(self.tree.topLevelItem(i).data(0, Qt.UserRole))
+            for i in range(self.tree.topLevelItemCount())
+        }
+        n_checked = len(self._checked_keys)
+        n_display_checked = len(self._checked_keys & displayed)
+        hidden = n_checked - n_display_checked
+
+        self.tree.blockSignals(True)
+        if displayed and n_display_checked == len(displayed):
+            self.chk_select_all.setCheckState(Qt.Checked)
+        elif n_display_checked > 0:
+            self.chk_select_all.setCheckState(Qt.PartiallyChecked)
+        else:
+            self.chk_select_all.setCheckState(Qt.Unchecked)
+        self.tree.blockSignals(False)
+
+        text = f"已选 {n_checked} 篇"
+        if hidden > 0:
+            text += f"，其中隐藏 {hidden} 篇"
+        self.lbl_selected.setText(text)
+        self.btn_download.setText(f"下载选中 ({n_checked})")
+        self.btn_download.setEnabled(n_checked > 0 and self.download_worker is None)
+        self.btn_clear_sel.setEnabled(n_checked > 0)
+
+    def _on_select_all_clicked(self, checked: bool):
+        """全选框：未选/部分 → 全选当前展示；已全选 → 取消当前展示。隐藏行勾选保留。"""
+        displayed = [
+            self.tree.topLevelItem(i).data(0, Qt.UserRole)
+            for i in range(self.tree.topLevelItemCount())
+        ]
+        if self.chk_select_all.checkState() == Qt.Unchecked:
+            for r in displayed:
+                self._checked_keys.discard(rerank.key(r))
+        else:
+            for r in displayed:
+                self._checked_keys.add(rerank.key(r))
+        self._render_results()
+
+    def _on_clear_selection(self):
+        self._checked_keys.clear()
+        self._render_results()
+
+    def _on_header_clicked(self, col: int):
+        """表头点击：日期列循环 最新→最早→相关度；相关度列直接回到相关度排序。"""
+        header = self.tree.header()
+        if col == 3:
+            if self._sort_mode == "date_desc":        # 最新优先 → 最早优先
+                self._sort_mode = "date_asc"
+                header.setSortIndicator(3, Qt.AscendingOrder)
+            elif self._sort_mode == "date_asc":       # 最早优先 → 回相关度
+                self._sort_mode = "relevance"
+                header.setSortIndicator(4, Qt.DescendingOrder)
+            else:                                     # 相关度（默认）→ 最新优先
+                self._sort_mode = "date_desc"
+                header.setSortIndicator(3, Qt.DescendingOrder)
+        elif col == 4:
+            self._sort_mode = "relevance"
+            header.setSortIndicator(4, Qt.DescendingOrder)
+        self._render_results()
 
     def _on_ai_toggled(self, checked: bool):
         if not checked:
@@ -676,13 +797,30 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_rerank_result(self, w, scores: dict, note: str) -> bool:
-        """应用精排结果（仅当前 worker 且当前代数）；返回是否被接受。可脱离信号直接测试。"""
+        """应用精排结果（仅当前 worker 且当前代数）；返回是否被接受。
+
+        分数到达时只更新相关度列的行内单元格，不重建表格（不打断阅读/勾选）；
+        排序等用户点击「相关度」表头或改动筛选时再生效。
+        """
         if not self._rerank_is_current(w):
             return False  # 过期结果（旧 worker 或旧查询代数），丢弃
         self.rerank_worker = None
         if scores:
             self._ai_scores.update(scores)
-            self._render_results()
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                r: SearchResult = item.data(0, Qt.UserRole)
+                if r is None:
+                    continue
+                ai = self._ai_scores.get(rerank.key(r))
+                if ai is None:
+                    continue
+                item.setText(4, str(ai))
+                if ai >= 7:
+                    item.setForeground(4, Qt.darkGreen)
+                elif ai <= 3:
+                    item.setForeground(4, Qt.red)
+            note = "相关度已更新，点击「相关度」表头按分数重排"
         self.lbl_status.setText(note)
         return True
 
@@ -708,14 +846,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ 勾选/下载
 
     def on_item_changed(self, item: QTreeWidgetItem, col: int):
+        """勾选变化：以稳定 ID 为源同步（隐藏行的勾选同样记录）。"""
         if col == 0:
-            self._update_selected_count()
-
-    def _update_selected_count(self):
-        n = sum(1 for i in range(self.tree.topLevelItemCount())
-                if i >= 0 and self.tree.topLevelItem(i).checkState(0) == Qt.Checked)
-        self.lbl_selected.setText(f"已选 {n} 篇")
-        self.btn_download.setEnabled(n > 0 and self.download_worker is None)
+            r: SearchResult = item.data(0, Qt.UserRole)
+            if r is not None:
+                key = rerank.key(r)
+                if item.checkState(0) == Qt.Checked:
+                    self._checked_keys.add(key)
+                else:
+                    self._checked_keys.discard(key)
+            self._sync_selection_ui()
 
     def check_all(self):
         state = Qt.Checked if any(
@@ -726,8 +866,12 @@ class MainWindow(QMainWindow):
             self.tree.topLevelItem(i).setCheckState(0, state)
 
     def on_preview(self, item: QTreeWidgetItem, col: int):
-        """双击：应用内抓取正文并预览（窗口内渲染，含图片）。"""
         r: SearchResult = item.data(0, Qt.UserRole)
+        if r is not None:
+            self.start_preview(r)
+
+    def start_preview(self, r: SearchResult):
+        """应用内抓取正文并预览（窗口内渲染，含图片）。由双击/悬浮卡「查看正文」触发。"""
         if r is None:
             return
         if self.preview_worker is not None:
@@ -772,10 +916,9 @@ class MainWindow(QMainWindow):
             item.setCheckState(0, Qt.Checked)
 
     def do_download(self):
+        # 以勾选集合为源（含被筛选隐藏的选中项），数量与界面一致
         items = [
-            self.tree.topLevelItem(i).data(0, Qt.UserRole)
-            for i in range(self.tree.topLevelItemCount())
-            if self.tree.topLevelItem(i).checkState(0) == Qt.Checked
+            self._results_by_key[k] for k in self._checked_keys if k in self._results_by_key
         ]
         if not items:
             return
@@ -816,7 +959,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.download_worker = None
         self.btn_search.setEnabled(True)
-        self._update_selected_count()
+        self._sync_selection_ui()
         base = self.cfg["base_dir"]
         self.lbl_status.setText(
             f"完成：成功 {ok} 篇，失败 {fail} 篇 → {topic_dir or base}"
@@ -832,10 +975,39 @@ class MainWindow(QMainWindow):
         os.makedirs(base, exist_ok=True)
         os.startfile(base)
 
+    def eventFilter(self, src, ev):
+        """结果表悬浮：停留约 180ms 展示零网络摘要卡（不含网络请求）。"""
+        if src is self.tree.viewport() and self._results:
+            t = ev.type()
+            if t in (QEvent.MouseMove, QEvent.HoverMove, QEvent.HoverEnter):
+                idx = self.tree.indexAt(ev.position().toPoint())
+                r: SearchResult | None = None
+                if idx.isValid():
+                    item = self.tree.topLevelItem(idx.row())
+                    r = item.data(0, Qt.UserRole) if item is not None else None
+                key = rerank.key(r) if r is not None else None
+                if r is not None and key != self._hover_key:
+                    self._hover_key = key
+                    self.summary_card.cancel_pending_show()
+                    self.summary_card.schedule_show(
+                        r, self.input.text().strip(), QCursor.pos(), 180
+                    )
+                elif r is None:
+                    if self._hover_key is not None:
+                        self._hover_key = None
+                        self.summary_card.cancel_pending_show()
+                        self.summary_card.schedule_close()
+            elif t in (QEvent.Leave, QEvent.HoverLeave):
+                self._hover_key = None
+                self.summary_card.cancel_pending_show()
+                self.summary_card.schedule_close()
+        return super().eventFilter(src, ev)
+
     def closeEvent(self, event):
         # 通知后台线程收尾并短暂等待；等不到就拦下关闭事件，
         # 由各线程原生 finished 触发 _try_finish_close 再真正关闭
         self._closing = True
+        self.summary_card.close_card()
         workers = [w for w in (
             self.search_worker, self.download_worker,
             self.rerank_worker, self.preview_worker,
@@ -879,15 +1051,39 @@ def main():
             print("SELFTEST FAIL:", e)
             return 1
 
+    # 截图模式：--shot <路径> 启动→自动搜索→自截窗口→退出（视觉验收用）
+    shot_path = None
+    if "--shot" in sys.argv:
+        i = sys.argv.index("--shot")
+        shot_path = sys.argv[i + 1] if len(sys.argv) > i + 1 else "ui_shot.png"
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     win = MainWindow()
     win.show()
     # 命令行带话题词则自动搜索：python app.py "AI 编程"
-    topic = " ".join(a for a in sys.argv[1:] if not a.startswith("-")).strip()
+    args = sys.argv[1:]
+    if "--shot" in args:
+        i = args.index("--shot")
+        args = args[:i] + args[i + 2:]  # 摘除 --shot 及其路径参数
+    topic = " ".join(a for a in args if not a.startswith("-")).strip()
     if topic:
         win.input.setText(topic)
         win.do_search()
+    if shot_path:
+        from PySide6.QtCore import QTimer
+
+        def _capture():
+            win.grab().save(shot_path)
+            app.quit()
+
+        def _wait_search():
+            if win.btn_search.isEnabled():  # 搜索完成（成功或失败）
+                QTimer.singleShot(900, _capture)  # 等布局稳定
+            else:
+                QTimer.singleShot(300, _wait_search)
+
+        QTimer.singleShot(400, _wait_search)
     sys.exit(app.exec())
 
 

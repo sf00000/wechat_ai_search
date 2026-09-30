@@ -1,6 +1,6 @@
 # 微信话题搜索下载器 (wechat-topic-searcher)
 
-![version](https://img.shields.io/badge/version-0.1.3-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
+![version](https://img.shields.io/badge/version-0.2.0-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
 
 输入一个话题，搜索高相关性的微信公众号文章，**AI 精排过滤跑题内容**，勾选后一键下载为本地 Markdown + 图片。单文件 exe，双击即用，正文全程不出本机。
 
@@ -11,6 +11,7 @@
 ## 功能
 
 - **话题搜索**：搜狗微信（腾讯自家微信垂直搜索）按文章检索，Bing / DuckDuckGo 兜底
+- **阅读体验**：三态全选（含被筛选隐藏的选中项，状态栏明确显示）、日期表头点击排序（最新→最早→相关度循环，按标准化时间戳）、零网络摘要悬浮卡（停留约 180ms 出现，Tab 固定后可选中复制，Esc 关闭，双击行或点「查看正文」才抓正文）
 - **相关性三层过滤**：
   - 本地规则重排（标题命中加权 + 时间新鲜度）
   - AI 语义精排：标题+摘要发给模型网关打 0-10 相关性分，跑题内容自动沉底（可开关）
@@ -19,7 +20,7 @@
 - **批量下载**：复用成熟爬虫核心，Markdown + 图片本地化，增量去重（重复下载自动跳过）
 - **可靠**：下载目录防逃逸与保留名清洗、微信链接严格主机校验、线程收尾等待
 - **快**：搜索结果本地缓存（重复搜索毫秒级）、勾选即时、下载后台队列逐篇实时刷新
-- **键盘流**：`Ctrl+F` 聚焦 · `空格` 勾选 · `Ctrl+A` 全选 · `回车` 下载 · `双击` 应用内预览 · `F5` 强制刷新
+- **键盘流**：`Ctrl+F` 聚焦 · `空格` 勾选 · `Ctrl+A` 全选当前 · `回车` 下载 · `双击` 应用内预览 · `F5` 强制刷新
 
 ## 快速开始
 
@@ -96,6 +97,7 @@ search_channels.py     # 搜狗主通道 + Bing/DDG 兜底 + 临时链接解析
 rerank.py              # 本地规则重排 + 筛选器 + AI 语义精排
 downloader.py          # 下载执行层（进程内调用爬虫，按话题落盘）
 mdflatten.py           # Markdown 落盘辅助（平铺/更新覆盖/增量日志）
+summary_popup.py       # 零网络摘要悬浮卡（悬浮/固定状态机）
 cache_store.py         # SQLite 搜索缓存 + 下载历史
 version.py             # 版本号
 vendor/                # 爬虫核心（来自 wechat-link-downloads skill）
@@ -111,6 +113,7 @@ build_exe.bat          # 打包脚本
 python tests/test_canonical.py   # 链接规范化解析单测
 python tests/test_rerank.py      # 重排/筛选/AI 解析单测
 python tests/e2e_test.py "话题"  # 端到端（真实搜索→勾选→下载→校验落盘）
+python app.py "话题" --shot ui.png  # 启动自动搜索并自截窗口（视觉验收）
 ```
 
 ## 隐私
