@@ -17,16 +17,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QThread, Signal, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QSpinBox, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from search_channels import SearchResult, SogouCaptchaError, SogouWeixin, search_all
@@ -203,6 +207,117 @@ class RerankWorker(QThread):
             self.done.emit(scores, "AI 精排完成，已按相关度重排")
 
 
+class PreviewWorker(QThread):
+    """后台抓取单篇文章用于预览（写临时目录，不影响下载缓存）。"""
+
+    done = Signal(dict)  # {title, author, date, md, images:[(占位名, 路径)], tmp, url} 或 {error}
+
+    def __init__(self, sogou: SogouWeixin, r: SearchResult, parent=None):
+        super().__init__(parent)
+        self.sogou, self.r = sogou, r
+
+    def run(self):
+        try:
+            r = self.r
+            if r.resolved and downloader.is_wechat_url(r.url):
+                real = r.url
+            else:
+                self.sogou.resolve(r)
+                real = r.url
+            scraper = downloader._load_scraper()
+            tmp = Path(tempfile.mkdtemp(prefix="wts_preview_"))
+            results = scraper.scrape_wechat(
+                urls=[real], delay=0,
+                images_dir=str(tmp / "images"), account_dir=str(tmp / "md"),
+            )
+            r0 = results[0] if results else {}
+            if not r0.get("success"):
+                self.done.emit({"error": r0.get("error") or "抓取失败"})
+                return
+            md_path = Path(r0.get("md_path") or "")
+            if md_path.is_file():
+                text = md_path.read_text(encoding="utf-8")
+            else:
+                text = r0.get("content") or ""
+            # 图片相对路径 → 占位符（渲染时用 addResource 注入本地图片）
+            images: list[tuple[str, str]] = []
+            bases = (md_path.parent, tmp)
+
+            def _repl(m: re.Match) -> str:
+                alt, rel = m.group(1), m.group(2)
+                for base in bases:
+                    p = (base / rel).resolve()
+                    if p.is_file():
+                        ph = f"previmg{len(images)}.png"
+                        images.append((ph, str(p)))
+                        return f"![{alt}]({ph})"
+                return m.group(0)
+
+            text = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)(\s+\"[^\"]*\")?\)", _repl, text)
+            self.done.emit(
+                {
+                    "title": r0.get("title") or r.title,
+                    "author": r0.get("author") or r.account,
+                    "date": r0.get("publish_time", ""),
+                    "md": text,
+                    "images": images,
+                    "tmp": str(tmp),
+                    "url": real,
+                }
+            )
+        except SogouCaptchaError as e:
+            self.done.emit({"error": str(e)})
+        except Exception as e:
+            self.done.emit({"error": f"预览失败：{e}"})
+
+
+class PreviewDialog(QDialog):
+    """应用内文章预览窗口（非模态，图片本地渲染）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("文章预览")
+        self.resize(780, 840)
+        self.tmp_dir: str | None = None
+        v = QVBoxLayout(self)
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        v.addWidget(self.browser)
+
+    def show_article(self, info: dict):
+        if "error" in info:
+            self.browser.setPlainText(
+                f"预览失败：{info['error']}\n\n可稍后重试，或右键结果用浏览器打开原文。"
+            )
+            self.setWindowTitle("文章预览")
+        else:
+            doc = self.browser.document()
+            doc.clear()
+            for ph, path in info.get("images", []):
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    doc.addResource(QTextDocument.ImageResource, QUrl(ph), pm)
+            header = (
+                f"# {info.get('title', '')}\n\n"
+                f"**{info.get('author', '')}**　{info.get('date', '')}\n\n---\n\n"
+            )
+            doc.setMarkdown(header + info["md"])
+            self.setWindowTitle(f"预览：{info.get('title', '')[:32]}")
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def cleanup_tmp(self):
+        if self.tmp_dir and Path(self.tmp_dir).exists():
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        self.tmp_dir = None
+
+    def closeEvent(self, event):
+        self.cleanup_tmp()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -212,6 +327,8 @@ class MainWindow(QMainWindow):
         self.search_worker: SearchWorker | None = None
         self.download_worker: DownloadWorker | None = None
         self.rerank_worker: RerankWorker | None = None
+        self.preview_worker: PreviewWorker | None = None
+        self.preview_dlg = PreviewDialog(self)
         self._results: list[SearchResult] = []   # 最近一次搜索的原始结果
         self._ai_scores: dict[str, int] = {}     # key -> AI 相关性分
         self._init_ui()
@@ -324,6 +441,8 @@ class MainWindow(QMainWindow):
         self.btn_open_dir.clicked.connect(self.open_base_dir)
         self.tree.itemChanged.connect(self.on_item_changed)
         self.tree.itemDoubleClicked.connect(self.on_preview)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
         # 筛选条件变化即时重渲染（不重新搜索）
         self.combo_days.currentIndexChanged.connect(self._render_results)
         self.spin_peracct.valueChanged.connect(self._render_results)
@@ -506,10 +625,48 @@ class MainWindow(QMainWindow):
             self.tree.topLevelItem(i).setCheckState(0, state)
 
     def on_preview(self, item: QTreeWidgetItem, col: int):
+        """双击：应用内抓取正文并预览（窗口内渲染，含图片）。"""
         r: SearchResult = item.data(0, Qt.UserRole)
-        url = r.sogou_link or r.url
-        if url:
-            QDesktopServices.openUrl(url)  # 搜狗临时链接在浏览器里会自动跳到原文
+        if r is None:
+            return
+        if self.preview_worker is not None:
+            return  # 已有预览在抓取
+        if self.download_worker is not None or self.search_worker is not None:
+            QMessageBox.information(self, "请稍候", "搜索或下载进行中，完成后再预览（共用网络会话）。")
+            return
+        self.lbl_status.setText("预览抓取中…")
+        self.preview_worker = PreviewWorker(self.sogou, r)
+        self.preview_worker.done.connect(self._on_preview_done)
+        self.preview_worker.start()
+        self.preview_dlg.browser.setPlainText("正在抓取文章正文…")
+        if not self.preview_dlg.isVisible():
+            self.preview_dlg.show()
+        self.preview_dlg.raise_()
+
+    def _on_preview_done(self, info: dict):
+        self.preview_worker = None
+        self.preview_dlg.tmp_dir = info.get("tmp")  # 关窗时统一清理
+        self.preview_dlg.show_article(info)
+        self.lbl_status.setText("就绪")
+
+    def _on_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        r: SearchResult = item.data(0, Qt.UserRole)
+        menu = QMenu(self)
+        act_preview = menu.addAction("预览（应用内打开）")
+        act_open = menu.addAction("在浏览器打开原文")
+        act_check = menu.addAction("勾选")
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen is act_preview:
+            self.on_preview(item, 0)
+        elif chosen is act_open:
+            url = (r.sogou_link or r.url) if r else ""
+            if url:
+                QDesktopServices.openUrl(url)
+        elif chosen is act_check:
+            item.setCheckState(0, Qt.Checked)
 
     def do_download(self):
         items = [

@@ -9,6 +9,7 @@ REM exe small (596MB -> 52MB).
 cd /d %~dp0
 python -m PyInstaller --noconfirm --onefile --windowed ^
   --icon assets\app.ico ^
+  --add-data "assets\app.ico;assets" ^
   --name wechat-topic-searcher ^
   --hidden-import markdownify --hidden-import tqdm ^
   --hidden-import bs4 --hidden-import lxml ^

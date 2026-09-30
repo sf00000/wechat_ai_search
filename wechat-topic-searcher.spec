@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/app.ico', 'assets')],
     hiddenimports=['markdownify', 'tqdm', 'bs4', 'lxml'],
     hookspath=[],
     hooksconfig={},

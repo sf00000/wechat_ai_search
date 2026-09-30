@@ -1,6 +1,6 @@
 # 微信话题搜索下载器 (wechat-topic-searcher)
 
-![version](https://img.shields.io/badge/version-0.1.0-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
+![version](https://img.shields.io/badge/version-0.1.1-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
 
 输入一个话题，搜索高相关性的微信公众号文章，**AI 精排过滤跑题内容**，勾选后一键下载为本地 Markdown + 图片。单文件 exe，双击即用，正文全程不出本机。
 
@@ -15,9 +15,10 @@
   - 本地规则重排（标题命中加权 + 时间新鲜度）
   - AI 语义精排：标题+摘要发给模型网关打 0-10 相关性分，跑题内容自动沉底（可开关）
   - 筛选器：时间范围 / 每号限流 / 包含词 / 排除词，改动即时生效
+- **应用内预览**：双击结果行，后台抓取文章正文在窗口内渲染（含图片），看完再决定下不下载；右键可改用系统浏览器打开原文
 - **批量下载**：复用成熟爬虫核心，Markdown + 图片本地化，增量去重（重复下载自动跳过）
 - **快**：搜索结果本地缓存（重复搜索毫秒级）、勾选即时、下载后台队列逐篇实时刷新
-- **键盘流**：`Ctrl+F` 聚焦 · `空格` 勾选 · `Ctrl+A` 全选 · `回车` 下载 · 双击预览原文 · `F5` 强制刷新
+- **键盘流**：`Ctrl+F` 聚焦 · `空格` 勾选 · `Ctrl+A` 全选 · `回车` 下载 · `双击` 应用内预览 · `F5` 强制刷新
 
 ## 快速开始
 
