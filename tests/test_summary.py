@@ -74,6 +74,36 @@ def main() -> int:
     card.close_card()
     print("5. 取消调度 OK")
 
+    # 6) pending/displayed 分离：固定与按钮只作用于画面实际内容（v0.2.0 P1 回归）
+    rA = SearchResult(title="文章A", snippet="A 的摘要", account="号A")
+    rB = SearchResult(title="文章B", snippet="B 的摘要", account="号B")
+    card.schedule_show(rA, "", QPoint(100, 100), 0)
+    card._show_now()
+    card.schedule_show(rB, "", QPoint(100, 100), 60000)  # B 已调度、未展示
+    card.pin()  # 此刻固定：应固定画面上的 A，而不是待展示的 B
+    assert card.is_pinned()
+    assert "文章A" in card.browser.toHtml(), "固定后内容被换成了未展示的 B"
+    seen = []
+    card.viewArticleRequested.connect(seen.append)
+    card._emit_view()
+    assert seen and seen[-1].title == "文章A", f"按钮操作对象错误: {seen[-1].title}"
+    card.close_card()
+
+    # 7) 关闭计时器到点时已固定 → 不关闭（v0.2.0 P1 回归）
+    card.schedule_show(rA, "", QPoint(100, 100), 0)
+    card._show_now()
+    card.schedule_close(30)  # 先安排关闭（模拟鼠标离开）
+    card.pin()               # 随即固定
+    import time as _t
+    deadline = _t.time() + 0.5
+    while _t.time() < deadline:
+        app.processEvents()
+        if not card.isVisible():
+            break
+    assert card.isVisible(), "固定后仍被关闭计时器收走"
+    card.close_card()
+    print("6/7. pending 分离与固定防误关 OK")
+
     print("摘要卡测试全部通过 OK")
     return 0
 

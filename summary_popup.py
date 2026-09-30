@@ -4,9 +4,13 @@
 一个复用的非模态卡片，状态机：隐藏 → 悬浮(hover) → 固定(pinned)。
 - 悬浮：鼠标在结果行停留约 180ms 后出现（由宿主调度，本模块只管展示与定时）；
 - 固定：Tab 或「固定」按钮；固定后不随鼠标换行，文本可选中复制、可滚动；
-- 关闭：Esc / 关闭按钮 / 鼠标离开行与卡片约 250ms。
+- 关闭：Esc / 关闭按钮 / 鼠标离开行与卡片约 250ms（关闭回调二次校验固定态）。
 
-只做展示：不联网、不抓正文、不调用 AI（查看正文按钮仅发出信号，由宿主决定）。
+关键不变量：
+- pending（已调度未展示）与 displayed（画面实际内容）分离；
+  固定与「查看正文/在浏览器打开」永远作用于 displayed；
+- 固定时同时停止展示与关闭两个计时器；
+- 只做展示：不联网、不抓正文、不调用 AI（查看正文按钮仅发出信号，由宿主决定）。
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import html as html_mod
 import re
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
 )
@@ -30,18 +34,44 @@ def _esc(text: str) -> str:
 
 
 def _highlight(escaped_text: str, query: str) -> str:
-    """在已转义文本上做查询词轻量高亮（查询词同样先转义再匹配）。"""
-    terms = [t for t in re.split(r"[\s,，、]+", (query or "").strip()) if len(t) >= 2]
-    for term in sorted(set(terms), key=len, reverse=True):
-        et = _esc(term)
-        if not et:
-            continue
-        pattern = re.compile(re.escape(et), re.IGNORECASE)
-        escaped_text = pattern.sub(
-            lambda m: f'<span style="background-color:#ffe58f;">{m.group(0)}</span>',
-            escaped_text,
-        )
-    return escaped_text
+    """在已转义文本上做查询词轻量高亮。
+
+    一次正则交替匹配所有词（单遍替换），避免后一个关键词命中前一次插入的
+    高亮标签本身。
+    """
+    terms = sorted(
+        {t for t in re.split(r"[\s,，、]+", (query or "").strip()) if len(t) >= 2},
+        key=len,
+        reverse=True,
+    )
+    if not terms:
+        return escaped_text
+    pattern = re.compile("|".join(re.escape(_esc(t)) for t in terms), re.IGNORECASE)
+    return pattern.sub(
+        lambda m: f'<span style="background-color:#ffe58f;">{m.group(0)}</span>',
+        escaped_text,
+    )
+
+
+def _snippet_html(snippet: str, query: str) -> str:
+    """摘要正文 HTML：按段落保留换行结构，段内空白折叠，逐段转义+高亮。"""
+    text = (snippet or "").strip()
+    if not text:
+        return '<span style="color:#999;">该结果没有搜索摘要</span>'
+
+    lines = [re.sub(r"[ \t\u3000]+", " ", ln).strip() for ln in text.splitlines()]
+    paragraphs = [ln for ln in lines if ln]
+    truncated = text.endswith("...") or text.endswith("…")
+    if not paragraphs:  # 只有空白（罕见）
+        paragraphs = [text]
+
+    parts = [
+        f'<p style="margin:0 0 8px 0;">{_highlight(_esc(pl), query)}</p>'
+        for pl in paragraphs
+    ]
+    if truncated:
+        parts.append('<span style="color:#999;">搜索摘要，内容可能不完整</span>')
+    return "".join(parts)
 
 
 def build_summary_html(r, query: str) -> str:
@@ -51,18 +81,10 @@ def build_summary_html(r, query: str) -> str:
     meta_bits = [b for b in (r.account, r.date_str, r.channel) if b]
     meta = _esc(" · ".join(meta_bits))
 
-    snippet = re.sub(r"\s+", " ", (r.snippet or "")).strip()
-    if snippet:
-        body = _highlight(_esc(snippet), query)
-        if snippet.endswith("...") or snippet.endswith("…"):
-            body += '<br><span style="color:#999;">搜索摘要，内容可能不完整</span>'
-    else:
-        body = '<span style="color:#999;">该结果没有搜索摘要</span>'
-
     return (
         f'<div style="font-size:15px; font-weight:bold; line-height:1.4;">{title}</div>'
         f'<div style="color:#666; margin:4px 0 10px 0;">{meta}</div>'
-        f'<div style="font-size:14px; line-height:1.5;">{body}</div>'
+        f'<div style="font-size:14px; line-height:1.5;">{_snippet_html(r.snippet, query)}</div>'
         f'<div style="color:#aaa; margin-top:10px; font-size:12px;">'
         f'Tab 固定 · Esc 关闭 · 双击行查看正文</div>'
     )
@@ -71,15 +93,16 @@ def build_summary_html(r, query: str) -> str:
 class SummaryCard(QWidget):
     """摘要悬浮卡（隐藏 / 悬浮 / 固定 三态）。宿主负责调度：schedule_show / schedule_close。"""
 
-    viewArticleRequested = Signal(object)    # SearchResult
-    openInBrowserRequested = Signal(object)
+    viewArticleRequested = Signal(object)    # displayed SearchResult
+    openInBrowserRequested = Signal(object)  # displayed SearchResult
 
     def __init__(self, parent=None):
         super().__init__(
             None,
             Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint,
         )
-        self._result = None
+        self._pending: object = None   # 已调度、尚未展示
+        self._displayed: object = None # 画面当前内容（固定与按钮以它为准）
         self._query = ""
         self._pinned = False
         self._anchor = QPoint()
@@ -90,7 +113,7 @@ class SummaryCard(QWidget):
 
         self._close_timer = QTimer(self)
         self._close_timer.setSingleShot(True)
-        self._close_timer.timeout.connect(self.close_card)
+        self._close_timer.timeout.connect(self._close_timeout)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(12, 10, 12, 8)
@@ -115,20 +138,28 @@ class SummaryCard(QWidget):
         btns.addStretch(1)
         v.addLayout(btns)
 
+        # Tab：卡片可见且未固定时截获为「固定」；固定后禁用，恢复卡片内正常焦点导航
+        self._tab_sc = QShortcut(QKeySequence(Qt.Key_Tab), self)
+        self._tab_sc.setContext(Qt.WidgetWithChildrenShortcut)
+        self._tab_sc.activated.connect(self.pin)
         self.setFixedWidth(CARD_WIDTH)
         self.hide()
 
     # ------------------------------------------------------ 悬浮调度（宿主调用）
 
     def schedule_show(self, r, query: str, anchor: QPoint, delay_ms: int = HOVER_DELAY_MS):
-        """鼠标停在某行：取消旧调度，delay 后展示该行摘要。已固定时不响应。"""
+        """鼠标停在某行：调度展示该行摘要。已固定时忽略。"""
         if self._pinned:
             return
-        self._result, self._query, self._anchor = r, query, anchor
+        self._pending = r
+        self._query = query
+        self._anchor = anchor
+        self._close_timer.stop()  # 重新进入有效结果行：取消未决的关闭
         self._show_timer.start(max(0, delay_ms))
 
     def cancel_pending_show(self):
         self._show_timer.stop()
+        self._pending = None
 
     def schedule_close(self, delay_ms: int = LEAVE_CLOSE_MS):
         if not self._pinned and self.isVisible():
@@ -140,12 +171,16 @@ class SummaryCard(QWidget):
     # ------------------------------------------------------ 状态切换
 
     def _show_now(self):
-        if self._pinned or self._result is None:
+        if self._pinned or self._pending is None:
             return
-        self.browser.setHtml(build_summary_html(self._result, self._query))
+        self._displayed = self._pending  # 展示时才切换操作对象
+        self._pending = None
+        self._close_timer.stop()         # 有效内容展示中，不关闭
+        self.browser.setHtml(build_summary_html(self._displayed, self._query))
         self._set_pinned_ui(False)
         self._place(self._anchor)
         self.show()
+        self._update_tab_sc()
 
     def toggle_pin(self):
         if self._pinned:
@@ -154,15 +189,23 @@ class SummaryCard(QWidget):
             self.pin()
 
     def pin(self):
-        if self._result is None or self._pinned:
+        """固定当前展示的内容；若仅有待展示内容则立即展示后固定。"""
+        if self._pinned:
             return
-        self._show_timer.stop()  # 固定当前内容
-        self._set_pinned_ui(True)
+        if self._displayed is None:
+            if self._pending is not None:
+                self._show_now()
+            else:
+                return
+        self._show_timer.stop()
+        self._close_timer.stop()  # 固定后绝不被关闭计时器收走
         self._pinned = True
+        self._set_pinned_ui(True)
         self.btn_pin.setText("已固定")
         if not self.isVisible():
             self._place(self._anchor)
             self.show()
+        self._update_tab_sc()
 
     def _unpin(self):
         self._pinned = False
@@ -174,13 +217,27 @@ class SummaryCard(QWidget):
         self.btn_pin.setText("固定 (Tab)")
         self._show_timer.stop()
         self._close_timer.stop()
+        self._pending = None
         self.hide()
+        self._update_tab_sc()
+
+    def _close_timeout(self):
+        if self._pinned:
+            return  # 关闭到点时已固定：不关
+        self.hide()
+        self._update_tab_sc()
+
+    def _update_tab_sc(self):
+        self._tab_sc.setEnabled(self.isVisible() and not self._pinned)
 
     def _set_pinned_ui(self, pinned: bool):
         self.btn_pin.setText("已固定" if pinned else "固定 (Tab)")
 
     def is_pinned(self) -> bool:
         return self._pinned
+
+    def displayed_result(self):
+        return self._displayed
 
     # ------------------------------------------------------ 位置
 
@@ -199,16 +256,11 @@ class SummaryCard(QWidget):
     # ------------------------------------------------------ 交互
 
     def keyPressEvent(self, ev):
-        key = ev.key()
-        if key == Qt.Key_Escape:
+        if ev.key() == Qt.Key_Escape:
             self.close_card()
             ev.accept()
             return
-        if key == Qt.Key_Tab and not self._pinned:
-            self.pin()
-            ev.accept()
-            return
-        super().keyPressEvent(ev)  # 固定后 Tab 交给卡片内正常焦点导航
+        super().keyPressEvent(ev)  # Tab 由 QShortcut 处理；固定后交给焦点导航
 
     def enterEvent(self, event):
         self.cancel_close()  # 从行移入卡片：保持打开
@@ -219,11 +271,11 @@ class SummaryCard(QWidget):
         super().leaveEvent(event)
 
     def _emit_view(self):
-        if self._result is not None:
-            self.viewArticleRequested.emit(self._result)
+        if self._displayed is not None:
+            self.viewArticleRequested.emit(self._displayed)
 
     def _emit_open(self):
-        if self._result is not None:
-            url = self._result.sogou_link or self._result.url
+        if self._displayed is not None:
+            url = self._displayed.sogou_link or self._displayed.url
             if url:
-                self.openInBrowserRequested.emit(self._result)
+                self.openInBrowserRequested.emit(self._displayed)

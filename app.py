@@ -397,6 +397,7 @@ class MainWindow(QMainWindow):
         self._results: list[SearchResult] = []   # 最近一次搜索的原始结果
         self._results_by_key: dict[str, SearchResult] = {}  # 稳定 ID → 结果（勾选状态源）
         self._checked_keys: set[str] = set()     # 已勾选的稳定 ID（跨筛选/排序保持）
+        self._dl_status: dict[str, tuple[str, bool]] = {}  # 稳定 ID → 下载状态（重建不丢）
         self._ai_scores: dict[str, int] = {}     # key -> AI 相关性分
         self._search_gen = 0                     # 搜索代数：丢弃过期查询的 AI 精排结果
         self._sort_mode = "relevance"            # relevance / date_desc / date_asc
@@ -599,6 +600,7 @@ class MainWindow(QMainWindow):
         ]
         self._results_by_key = {rerank.key(r): r for r in self._results}
         self._checked_keys = set()  # 新查询：勾选从零开始
+        self._dl_status = {}
         self._ai_scores = {}
         self._render_results()
         # AI 精排：异步打分，完成后自动重排（不挡搜索/勾选/下载操作）。
@@ -692,7 +694,11 @@ class MainWindow(QMainWindow):
             elif red:
                 item.setForeground(4, Qt.red)
             prev = self.store.get_download(r.url) if r.url else None
-            if prev:
+            st = self._dl_status.get(rerank.key(r))
+            if st is not None:
+                item.setText(5, st[0])
+                item.setForeground(5, Qt.red if st[1] else Qt.darkGreen)
+            elif prev:
                 item.setText(5, "\u2713 此前已下载")
                 item.setForeground(5, Qt.gray)
             self.tree.addTopLevelItem(item)
@@ -756,13 +762,11 @@ class MainWindow(QMainWindow):
         """表头点击：日期列循环 最新→最早→相关度；相关度列直接回到相关度排序。"""
         header = self.tree.header()
         if col == 3:
-            if self._sort_mode == "date_desc":        # 最新优先 → 最早优先
+            # 两态循环 最新↔最早；恢复相关度请点「相关度」表头
+            if self._sort_mode == "date_desc":
                 self._sort_mode = "date_asc"
                 header.setSortIndicator(3, Qt.AscendingOrder)
-            elif self._sort_mode == "date_asc":       # 最早优先 → 回相关度
-                self._sort_mode = "relevance"
-                header.setSortIndicator(4, Qt.DescendingOrder)
-            else:                                     # 相关度（默认）→ 最新优先
+            else:
                 self._sort_mode = "date_desc"
                 header.setSortIndicator(3, Qt.DescendingOrder)
         elif col == 4:
@@ -942,6 +946,10 @@ class MainWindow(QMainWindow):
         self.download_worker.start()
 
     def on_item_status(self, url: str, text: str, error: bool):
+        key = next((k for k, r in self._results_by_key.items()
+                    if r.url == url or r.sogou_link == url), None)
+        if key is not None:
+            self._dl_status[key] = (text, error)  # 重建后按 ID 恢复
         for i in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(i)
             r: SearchResult = item.data(0, Qt.UserRole)
@@ -976,31 +984,44 @@ class MainWindow(QMainWindow):
         os.startfile(base)
 
     def eventFilter(self, src, ev):
-        """结果表悬浮：停留约 180ms 展示零网络摘要卡（不含网络请求）。"""
-        if src is self.tree.viewport() and self._results:
-            t = ev.type()
-            if t in (QEvent.MouseMove, QEvent.HoverMove, QEvent.HoverEnter):
-                idx = self.tree.indexAt(ev.position().toPoint())
-                r: SearchResult | None = None
-                if idx.isValid():
-                    item = self.tree.topLevelItem(idx.row())
-                    r = item.data(0, Qt.UserRole) if item is not None else None
-                key = rerank.key(r) if r is not None else None
-                if r is not None and key != self._hover_key:
-                    self._hover_key = key
-                    self.summary_card.cancel_pending_show()
-                    self.summary_card.schedule_show(
-                        r, self.input.text().strip(), QCursor.pos(), 180
-                    )
-                elif r is None:
-                    if self._hover_key is not None:
-                        self._hover_key = None
-                        self.summary_card.cancel_pending_show()
-                        self.summary_card.schedule_close()
-            elif t in (QEvent.Leave, QEvent.HoverLeave):
+        """结果表：悬浮展示摘要卡；卡片可见未固定时截获 Tab 为「固定」。"""
+        if src is not self.tree.viewport():
+            return super().eventFilter(src, ev)
+
+        t = ev.type()
+        if (
+            t == QEvent.KeyPress
+            and ev.key() == Qt.Key_Tab
+            and self.summary_card.isVisible()
+            and not self.summary_card.is_pinned()
+        ):
+            self.summary_card.pin()  # 焦点在结果表时的 Tab = 固定摘要卡
+            return True
+
+        if not self._results:
+            return super().eventFilter(src, ev)
+
+        if t in (QEvent.MouseMove, QEvent.HoverMove, QEvent.HoverEnter):
+            idx = self.tree.indexAt(ev.position().toPoint())
+            r: SearchResult | None = None
+            if idx.isValid():
+                item = self.tree.topLevelItem(idx.row())
+                r = item.data(0, Qt.UserRole) if item is not None else None
+            key = rerank.key(r) if r is not None else None
+            if r is not None and key != self._hover_key:
+                self._hover_key = key
+                self.summary_card.cancel_pending_show()
+                self.summary_card.schedule_show(
+                    r, self.input.text().strip(), QCursor.pos(), 180
+                )
+            elif r is None and self._hover_key is not None:
                 self._hover_key = None
                 self.summary_card.cancel_pending_show()
                 self.summary_card.schedule_close()
+        elif t in (QEvent.Leave, QEvent.HoverLeave):
+            self._hover_key = None
+            self.summary_card.cancel_pending_show()
+            self.summary_card.schedule_close()
         return super().eventFilter(src, ev)
 
     def closeEvent(self, event):

@@ -126,10 +126,44 @@ def test_stale_rerank_discarded() -> int:
     return 0
 
 
+def test_date_two_state_and_status_by_id() -> int:
+    """日期表头两态（最新↔最早）；下载状态按稳定 ID 保留，重建列表不丢。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    import app as app_mod
+
+    win = app_mod.MainWindow()
+    url = "https://mp.weixin.qq.com/s?__biz=MzIzODI1NjkyMQ==&mid=1&idx=1&sn=abc"
+    r = SearchResult(url=url, resolved=True, title="状态保留文章", account="号")
+    win.input.setText("测试")
+    win.on_search_done([r.to_dict()], "自测")
+
+    # 日期两态：相关度 → desc → asc → desc（永远两态，不再三态循环）
+    win.tree.header().sectionClicked.emit(3)
+    assert win._sort_mode == "date_desc", win._sort_mode
+    win.tree.header().sectionClicked.emit(3)
+    assert win._sort_mode == "date_asc", win._sort_mode
+    win.tree.header().sectionClicked.emit(3)
+    assert win._sort_mode == "date_desc", "日期排序应为两态循环"
+
+    # 下载状态按 ID 记录，表格重建后仍在
+    win.on_item_status(url, "✓ 已抓取", False)
+    win._render_results()
+    item = win.tree.topLevelItem(0)
+    assert item.text(5) == "✓ 已抓取", f"状态列丢失: {item.text(5)!r}"
+    win.store.close()
+    print("4. 日期两态 + 下载状态按 ID 保留 OK")
+    return 0
+
+
 def main() -> int:
     test_fail_callback_no_unboundlocal()
     test_fallback_result_downloads_without_resolve()
     test_stale_rerank_discarded()
+    test_date_two_state_and_status_by_id()
     print("回归测试全部通过 OK")
     return 0
 
