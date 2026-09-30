@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-REM Build single-file exe: dist\wechat-topic-searcher.exe
+REM Build single-file exe: dist\wechat-topic-searcher.exe, then run --selftest.
 REM wechat_scraper_v2 (vendor/) is loaded dynamically at runtime, so PyInstaller
 REM cannot see its deps -- listed via hidden-import.
 REM torch/transformers/... are pulled in by optional-import chains in
@@ -23,5 +23,17 @@ python -m PyInstaller --noconfirm --onefile --windowed ^
   --exclude-module fsspec --exclude-module IPython --exclude-module jupyter ^
   --exclude-module cv2 --exclude-module skimage --exclude-module PIL ^
   app.py
+if errorlevel 1 goto :fail
+
+REM 打包后自检：验证爬虫核心在包体内可加载（打包缺陷在此即暴露）
+dist\wechat-topic-searcher.exe --selftest
+if errorlevel 1 goto :fail
+
 echo.
 echo Done: dist\wechat-topic-searcher.exe
+exit /b 0
+
+:fail
+echo.
+echo BUILD FAILED
+exit /b 1

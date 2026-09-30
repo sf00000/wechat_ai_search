@@ -1,5 +1,5 @@
 {
-  "base_dir": "G:/workbuddy/wechat_data/topic_search_downloads",
+  "base_dir": "",
   "search_pages": 2,
   "download_delay": 1.0,
   "cache_ttl_minutes": 30,

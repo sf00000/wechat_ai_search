@@ -4,6 +4,7 @@ __pycache__/
 
 # 本机构建产物
 build/
+*.spec
 dist/
 
 # 运行时生成

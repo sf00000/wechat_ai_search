@@ -67,7 +67,27 @@ def load_config() -> dict:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             pass
+    # 基本校验：空值回退默认、数值钳位，防止配置文件写坏后功能异常
+    if not str(cfg.get("base_dir") or "").strip():
+        cfg["base_dir"] = DEFAULT_CONFIG["base_dir"]
+    try:
+        cfg["search_pages"] = min(10, max(1, int(cfg.get("search_pages", 2))))
+    except (TypeError, ValueError):
+        cfg["search_pages"] = 2
+    try:
+        cfg["download_delay"] = min(30.0, max(0.0, float(cfg.get("download_delay", 1.0))))
+    except (TypeError, ValueError):
+        cfg["download_delay"] = 1.0
+    try:
+        cfg["cache_ttl_minutes"] = min(24 * 60, max(1.0, float(cfg.get("cache_ttl_minutes", 30))))
+    except (TypeError, ValueError):
+        cfg["cache_ttl_minutes"] = 30
+    cfg["ai_rerank"] = bool(cfg.get("ai_rerank", True))
     return cfg
+
+
+class DownloadAborted(Exception):
+    """窗口关闭触发的下载中止（经 progress_callback 抛出以中断爬虫批次）。"""
 
 
 class SearchWorker(QThread):
@@ -83,6 +103,8 @@ class SearchWorker(QThread):
         self.pages, self.ttl_min, self.force = pages, ttl_min, force
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         cache_key = f"{self.query}#p{self.pages}"  # 缓存键包含页数，配置变化不串缓存
         # 缓存命中 → 毫秒级返回
         if not self.force:
@@ -121,6 +143,9 @@ class DownloadWorker(QThread):
         resolved: list[tuple[SearchResult, str]] = []
         n_fail = 0
         for r in self.items:
+            if self.isInterruptionRequested():
+                self.finished_all.emit(0, n_fail, "")
+                return
             if downloader.is_wechat_url(r.url):
                 r.resolved = True
                 resolved.append((r, r.url))
@@ -143,6 +168,8 @@ class DownloadWorker(QThread):
 
         def cb(idx: int, total: int, result: dict) -> None:
             nonlocal n_fail
+            if self.isInterruptionRequested():
+                raise DownloadAborted()  # 经回调抛出，中断爬虫批次（不落半截 md）
             self.batch_progress.emit(idx, total)
             u = (result.get("url") or "").split("#", 1)[0]
             item = url2item.get(u) or url2item.get(real_urls[idx - 1] if 0 < idx <= len(real_urls) else "")
@@ -165,6 +192,9 @@ class DownloadWorker(QThread):
                 real_urls, self.topic, self.base_dir,
                 delay=self.delay, progress_cb=cb,
             )
+        except DownloadAborted:
+            self.finished_all.emit(0, 0, "")  # 窗口关闭触发的中止
+            return
         except Exception as e:
             for _, real in resolved:
                 self.item_status.emit(url2item[real].sogou_link or url2item[real].url, f"✗ {e}", True)
@@ -192,17 +222,23 @@ class DownloadWorker(QThread):
 
 
 class RerankWorker(QThread):
-    """后台 AI 精排：标题+摘要发网关打相关性分。失败静默兜底为规则排序。"""
+    """后台 AI 精排：标题+摘要发网关打相关性分。失败静默兜底为规则排序。
+
+    gen：发起时的搜索代数；结果只在该代数仍是当前查询时才被应用。
+    """
 
     done = Signal(dict, str)  # ({key: 分数}, 提示信息)
 
     def __init__(self, query: str, items: list, model: str = "",
-                 base: str = "", token: str = "", parent=None):
+                 base: str = "", token: str = "", gen: int = 0, parent=None):
         super().__init__(parent)
         self.query, self.items, self.model = query, items, model
         self.base, self.token = base, token
+        self.gen = gen
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         try:
             scores = rerank.ai_scores(
                 self.query, self.items, model=self.model or None,
@@ -210,6 +246,8 @@ class RerankWorker(QThread):
             )
         except Exception as e:
             self.done.emit({}, f"AI 精排失败：{e}")
+            return
+        if self.isInterruptionRequested():
             return
         if scores is None:
             self.done.emit({}, "AI 精排失败（网关未配置或超时），已按本地规则排序")
@@ -227,6 +265,8 @@ class PreviewWorker(QThread):
         self.sogou, self.r = sogou, r
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         try:
             r = self.r
             if r.resolved and downloader.is_wechat_url(r.url):
@@ -245,6 +285,9 @@ class PreviewWorker(QThread):
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise
             r0 = results[0] if results else {}
+            if self.isInterruptionRequested():
+                shutil.rmtree(tmp, ignore_errors=True)
+                return
             if not r0.get("success"):
                 shutil.rmtree(tmp, ignore_errors=True)  # 抓取失败即时清理临时目录
                 self.done.emit({"error": r0.get("error") or "抓取失败"})
@@ -346,8 +389,21 @@ class MainWindow(QMainWindow):
         self.preview_dlg = PreviewDialog(self)
         self._results: list[SearchResult] = []   # 最近一次搜索的原始结果
         self._ai_scores: dict[str, int] = {}     # key -> AI 相关性分
+        self._search_gen = 0                     # 搜索代数：丢弃过期查询的 AI 精排结果
+        self._closing = False
         self._init_ui()
         self._init_shortcuts()
+
+    def _track_worker(self, w: QThread, attr: str):
+        """线程原生 finished：清引用 + 关闭流程中触发收尾检查。"""
+
+        def _finished():
+            if getattr(self, attr) is w:
+                setattr(self, attr, None)
+            if self._closing:
+                self._try_finish_close()
+
+        w.finished.connect(_finished)
 
     # ------------------------------------------------------------------ UI
 
@@ -492,6 +548,7 @@ class MainWindow(QMainWindow):
             return  # 已有搜索在途（结果按 sender 校验，过期自动丢弃）
         self.btn_search.setEnabled(False)
         self.lbl_status.setText("搜索中…")
+        self._search_gen += 1  # 新查询使在途的旧 AI 精排结果过期
         self.search_worker = SearchWorker(
             self.sogou, self.store, query,
             pages=int(self.cfg.get("search_pages", 2)),
@@ -500,6 +557,7 @@ class MainWindow(QMainWindow):
         )
         self.search_worker.done.connect(self.on_search_done)
         self.search_worker.failed.connect(self.on_search_failed)
+        self._track_worker(self.search_worker, "search_worker")
         self.search_worker.start()
 
     def on_search_done(self, results: list, note: str):
@@ -514,12 +572,12 @@ class MainWindow(QMainWindow):
         ]
         self._ai_scores = {}
         self._render_results()
-        # AI 精排：异步打分，完成后自动重排（不挡搜索/勾选/下载操作）
+        # AI 精排：异步打分，完成后自动重排（不挡搜索/勾选/下载操作）。
+        # 允许与上一代精排并行：旧结果按 gen 过期丢弃，不会污染新查询。
         if (
             self.chk_ai.isChecked()
             and self.chk_ai.isEnabled()
             and self._results
-            and self.rerank_worker is None
         ):
             self.lbl_status.setText(note + "；AI 精排中…")
             self.rerank_worker = RerankWorker(
@@ -527,8 +585,10 @@ class MainWindow(QMainWindow):
                 model=str(self.cfg.get("rerank_model", "") or ""),
                 base=str(self.cfg.get("api_base", "") or ""),
                 token=str(self.cfg.get("api_token", "") or ""),
+                gen=self._search_gen,
             )
             self.rerank_worker.done.connect(self._on_rerank_done)
+            self._track_worker(self.rerank_worker, "rerank_worker")
             self.rerank_worker.start()
         else:
             self.lbl_status.setText(note)
@@ -593,25 +653,41 @@ class MainWindow(QMainWindow):
         if not checked:
             self._render_results()  # 取消勾选：回退到规则排序（分数保留，取消勾选即忽略）
             return
-        if self._results and not self._ai_scores and self.rerank_worker is None:
+        if self._results and not self._ai_scores:
             self.lbl_status.setText("AI 精排中…")
             self.rerank_worker = RerankWorker(
                 self.input.text().strip(), list(self._results),
                 model=str(self.cfg.get("rerank_model", "") or ""),
                 base=str(self.cfg.get("api_base", "") or ""),
                 token=str(self.cfg.get("api_token", "") or ""),
+                gen=self._search_gen,
             )
             self.rerank_worker.done.connect(self._on_rerank_done)
+            self._track_worker(self.rerank_worker, "rerank_worker")
             self.rerank_worker.start()
 
-    def _on_rerank_done(self, scores: dict, note: str):
-        if self.sender() is not self.rerank_worker:
-            return  # 过期结果（属于上一次搜索的精排），丢弃
+    def _rerank_is_current(self, w) -> bool:
+        """精排结果只属于"当前 worker 且当前搜索代数"，否则丢弃（防跨查询污染）。"""
+        return (
+            w is not None
+            and w is self.rerank_worker
+            and getattr(w, "gen", None) == self._search_gen
+            and not self._closing
+        )
+
+    def _apply_rerank_result(self, w, scores: dict, note: str) -> bool:
+        """应用精排结果（仅当前 worker 且当前代数）；返回是否被接受。可脱离信号直接测试。"""
+        if not self._rerank_is_current(w):
+            return False  # 过期结果（旧 worker 或旧查询代数），丢弃
         self.rerank_worker = None
         if scores:
             self._ai_scores.update(scores)
             self._render_results()
         self.lbl_status.setText(note)
+        return True
+
+    def _on_rerank_done(self, scores: dict, note: str):
+        self._apply_rerank_result(self.sender(), scores, note)
 
     def on_search_failed(self, msg: str):
         if self.sender() is not self.search_worker:
@@ -662,6 +738,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("预览抓取中…")
         self.preview_worker = PreviewWorker(self.sogou, r)
         self.preview_worker.done.connect(self._on_preview_done)
+        self._track_worker(self.preview_worker, "preview_worker")
         self.preview_worker.start()
         self.preview_dlg.browser.setPlainText("正在抓取文章正文…")
         if not self.preview_dlg.isVisible():
@@ -718,6 +795,7 @@ class MainWindow(QMainWindow):
         self.download_worker.item_status.connect(self.on_item_status)
         self.download_worker.batch_progress.connect(self.on_batch_progress)
         self.download_worker.finished_all.connect(self.on_download_done)
+        self._track_worker(self.download_worker, "download_worker")
         self.download_worker.start()
 
     def on_item_status(self, url: str, text: str, error: bool):
@@ -750,13 +828,14 @@ class MainWindow(QMainWindow):
             )
 
     def open_base_dir(self):
-        base = self.cfg["base_dir"]
+        base = os.path.expanduser(str(self.cfg["base_dir"]))
         os.makedirs(base, exist_ok=True)
         os.startfile(base)
 
     def closeEvent(self, event):
-        # 通知后台线程收尾并短暂等待；等待不到就不关 SQLite（避免线程写已关库崩溃，
-        # 进程退出时由系统回收）
+        # 通知后台线程收尾并短暂等待；等不到就拦下关闭事件，
+        # 由各线程原生 finished 触发 _try_finish_close 再真正关闭
+        self._closing = True
         workers = [w for w in (
             self.search_worker, self.download_worker,
             self.rerank_worker, self.preview_worker,
@@ -767,9 +846,25 @@ class MainWindow(QMainWindow):
             if w.isRunning():
                 w.wait(2000)
         self.preview_dlg.cleanup_tmp()
-        if not any(w is not None and w.isRunning() for w in workers):
+        if any(w is not None and w.isRunning() for w in workers):
+            event.ignore()
+            self.lbl_status.setText("后台任务收尾中，完成后自动关闭…")
+        else:
             self.store.close()
-        super().closeEvent(event)
+            super().closeEvent(event)
+
+    def _try_finish_close(self):
+        if not self._closing:
+            return
+        workers = [w for w in (
+            self.search_worker, self.download_worker,
+            self.rerank_worker, self.preview_worker,
+        ) if w is not None]
+        if any(w is not None and w.isRunning() for w in workers):
+            return
+        self.preview_dlg.cleanup_tmp()
+        self.store.close()
+        self.close()
 
 
 def main():

@@ -37,13 +37,18 @@ def main() -> int:
 
     print("topic_dir 防逃逸/保留名/空值 OK")
 
-    # 严格 URL 校验（与 UI 下载路径一致使用 downloader.is_wechat_url → scraper._is_wechat_host）
+    # 严格 URL 校验（下载路径用 scraper 的 hostname 白名单，搜索侧用 _is_mp_url 双保险）
     from search_channels import _is_mp_url, _is_wechat_article
 
-    assert downloader.is_wechat_url("https://mp.weixin.qq.com/s?__biz=x") or True
-    # scraper 的 _is_wechat_host 与 search_channels 的严格校验双重保险
+    assert downloader.is_wechat_url("https://mp.weixin.qq.com/s?__biz=x")
+    assert not downloader.is_wechat_url("https://mp.weixin.qq.com.evil.example/s?x")
+    assert not downloader.is_wechat_url("https://evil.example/?next=mp.weixin.qq.com")
     assert not _is_mp_url("https://mp.weixin.qq.com.evil.example/s?x")
-    assert not _is_wechat_article("https://mp.weixin.qq.com.evil.example/s/x")
+    assert not _is_mp_url("http://mp.weixin.qq.com.attacker.io/s")
+    assert not _is_mp_url("ftp://mp.weixin.qq.com/s")
+    assert _is_mp_url("https://mp.weixin.qq.com/s?src=11&timestamp=1")
+    assert _is_wechat_article("https://mp.weixin.qq.com/s/AbCd_-123")
+    assert not _is_wechat_article("https://mp.weixin.qq.com/faq")
     print("URL 伪装拒绝 OK")
 
     print("downloader 单测全部通过 OK")

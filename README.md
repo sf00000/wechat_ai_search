@@ -1,6 +1,6 @@
 # 微信话题搜索下载器 (wechat-topic-searcher)
 
-![version](https://img.shields.io/badge/version-0.1.2-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
+![version](https://img.shields.io/badge/version-0.1.3-green) ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![python](https://img.shields.io/badge/Python-3.10%2B-yellow)
 
 输入一个话题，搜索高相关性的微信公众号文章，**AI 精排过滤跑题内容**，勾选后一键下载为本地 Markdown + 图片。单文件 exe，双击即用，正文全程不出本机。
 

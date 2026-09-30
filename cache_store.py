@@ -32,18 +32,25 @@ class Store:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
-        self._conn.executescript(_SCHEMA)
+        self._conn_or_raise().executescript(_SCHEMA)
         self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def _conn_or_raise(self):
+        if self._conn is None:
+            raise RuntimeError("store already closed")
+        return self._conn
 
     # -- 搜索缓存 -------------------------------------------------------
 
     def get_cached_search(self, query: str, ttl_seconds: float) -> list[dict] | None:
         with self._lock:
-            row = self._conn.execute(
+            row = self._conn_or_raise().execute(
                 "SELECT fetched_at, results FROM search_cache WHERE query=?", (query,)
             ).fetchone()
         if row is None:
@@ -58,7 +65,7 @@ class Store:
 
     def save_search(self, query: str, results: list[dict]) -> None:
         with self._lock:
-            self._conn.execute(
+            self._conn_or_raise().execute(
                 "INSERT INTO search_cache(query, fetched_at, results) VALUES(?,?,?) "
                 "ON CONFLICT(query) DO UPDATE SET fetched_at=?, results=?",
                 (query, time.time(), json.dumps(results, ensure_ascii=False),
@@ -70,7 +77,7 @@ class Store:
 
     def record_download(self, url: str, title: str, author: str, md_path: str, topic: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._conn_or_raise().execute(
                 "INSERT INTO downloads(url, title, author, md_path, topic, done_at) "
                 "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(url) DO UPDATE SET title=?, author=?, md_path=?, topic=?, done_at=?",
@@ -81,7 +88,7 @@ class Store:
 
     def get_download(self, url: str) -> dict | None:
         with self._lock:
-            row = self._conn.execute(
+            row = self._conn_or_raise().execute(
                 "SELECT title, author, md_path, topic, done_at FROM downloads WHERE url=?",
                 (url,),
             ).fetchone()
