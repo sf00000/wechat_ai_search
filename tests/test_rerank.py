@@ -51,7 +51,7 @@ def main() -> int:
     assert rerank._parse_scores("模型罢工了", 2) is None
     print("② AI 返回解析 OK：裸 JSON / 代码块 / 越界截断 / 垃圾文本")
 
-    print("rerank 离线单测全部通过 ✅")
+    print("rerank 离线单测全部通过 OK")
     return 0
 
 

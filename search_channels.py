@@ -138,10 +138,15 @@ class SogouWeixin:
         seen: set[str] = set()
         for page in range(1, max(1, max_pages) + 1):
             url = SOGOU_SEARCH.format(q=urllib.parse.quote(query), page=page)
-            resp = self._get(url)
-            if resp.status_code != 200:
-                break
-            page_items = self._parse_results(resp.text)
+            page_items: list[SearchResult] = []
+            for attempt in range(2):  # 搜狗偶发 200 空页，稍候重试一次
+                resp = self._get(url)
+                if resp.status_code != 200:
+                    break
+                page_items = self._parse_results(resp.text)
+                if page_items or attempt:
+                    break
+                time.sleep(2.0)
             fresh = 0
             for r in page_items:
                 if r.sogou_link in seen:
@@ -210,6 +215,20 @@ class SogouWeixin:
 
     # -- 临时链接 → 真实文章地址 ----------------------------------------
 
+    @staticmethod
+    def _extract_canonical(page_text: str) -> str | None:
+        """从签名页 HTML 里提取规范文章地址（https://mp.weixin.qq.com/s?__biz=...）。"""
+        RAW_X26 = chr(92) + "x26"  # 页面里的字面转义序列（反斜杠 x 2 6）
+        for m in _CANONICAL_RE.finditer(page_text or ""):
+            candidate = html.unescape(m.group(0).replace(RAW_X26, "&"))
+            if "${" in candidate or "window." in candidate:
+                continue  # JS 模板串，跳过
+            cand = candidate if candidate.startswith(("http://", "https://")) else "https://" + candidate
+            if _is_mp_url(cand) and SogouWeixin._is_canonical(cand):
+                # 必须保留 chksm/scene：剥掉会命中微信验证页（content_empty）
+                return cand.split("#", 1)[0]
+        return None
+
     def resolve(self, result: SearchResult) -> str:
         """把搜狗临时链接解析为可直接抓取的文章地址（结果缓存在对象上）。
 
@@ -231,20 +250,15 @@ class SogouWeixin:
             joined = "".join(frags).replace("@", "")
             if joined.startswith("http"):
                 result.url = joined
-        if not (result.url and "mp.weixin.qq.com" in result.url):
+        if not _is_mp_url(result.url):
             raise RuntimeError(f"解析文章真实链接失败：{result.title}")
 
         # 签名地址 → 规范地址（规范地址对应标准文章模板，爬虫才能提取正文）
         try:
             page = self._get(result.url, referer="https://mp.weixin.qq.com/")
-            for m in _CANONICAL_RE.finditer(page.text or ""):
-                candidate = html.unescape(m.group(0).replace("\\x26", "&"))
-                if "${" in candidate or "window." in candidate:
-                    continue  # JS 模板串，跳过
-                if self._is_canonical(candidate):
-                    # 必须保留 chksm/scene：剥掉会命中微信验证页（content_empty）
-                    result.url = candidate.split("#", 1)[0]
-                    break
+            canonical = self._extract_canonical(page.text or "")
+            if canonical:
+                result.url = canonical
         except Exception:
             pass  # 规范化失败就退回签名地址（部分文章签名页也能抓）
 
@@ -278,11 +292,20 @@ def _normalize_url(url: str) -> str:
     return url.split("#", 1)[0].strip()
 
 
+def _is_mp_url(url: str) -> bool:
+    """严格校验：http(s) + 主机名精确等于 mp.weixin.qq.com（防子域伪装）。"""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return False
+    return u.scheme in ("http", "https") and (u.hostname or "").lower() == "mp.weixin.qq.com"
+
+
 def _is_wechat_article(url: str) -> bool:
-    u = (url or "").lower()
-    return u.startswith("http") and "mp.weixin.qq.com" in u and (
-        "/s?" in u or "/s/" in u or u.rstrip("/").endswith("/s")
-    )
+    if not _is_mp_url(url):
+        return False
+    path = urllib.parse.urlsplit(url).path
+    return path == "/s" or path.startswith("/s/")
 
 
 def _extract_date(text: str) -> str:
@@ -339,7 +362,9 @@ def _dedupe_rank_web(raw: list[tuple[str, str, str]], query: str, channel: str, 
             title=title or "(无标题)",
             snippet=snippet,
             date_str=_extract_date(text),
+            score=0.0,
             channel=channel,
+            resolved=True,  # 兜底结果已是真实文章地址
         )
     out = list(results.values())
     for r in out:

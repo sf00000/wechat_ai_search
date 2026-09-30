@@ -193,15 +193,21 @@ def ai_scores(
         resp = requests.post(
             f"{base}/v1/messages", json=payload, headers=headers, timeout=AI_TIMEOUT_S
         )
-        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"网关请求失败：{e.__class__.__name__}: {e}") from e
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"网关返回 HTTP {resp.status_code}（鉴权失败/模型名错误等）：{resp.text[:120]}"
+        )
+    try:
         body = resp.json()
-    except Exception:
-        return None
+    except ValueError as e:
+        raise RuntimeError("网关返回非 JSON 响应") from e
 
     text = "".join(
         p.get("text", "") for p in (body.get("content") or []) if isinstance(p, dict)
     )
     parsed = _parse_scores(text, len(items))
     if parsed is None:
-        return None
+        raise RuntimeError("模型返回无法解析为分数 JSON（可尝试更换 rerank_model）")
     return {key(it): s for i, it in enumerate(items) if (i in parsed) for s in [parsed[i]]}

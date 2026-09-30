@@ -22,10 +22,12 @@ from app import MainWindow
 
 
 def main() -> int:
-    topic = sys.argv[1] if len(sys.argv) > 1 else "AI 编程"
+    import time as _t
+    query = sys.argv[1] if len(sys.argv) > 1 else "AI 编程"
+    topic = f"{query}_e2e{_t.strftime('%H%M%S')}"  # 仅下载目录带后缀，搜索词保持干净
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.input.setText(topic)
+    win.input.setText(query)
     win.chk_force.setChecked(True)  # 强制联网，验证真实链路
 
     win.do_search()
@@ -50,6 +52,7 @@ def main() -> int:
         win.tree.topLevelItem(i).setCheckState(0, Qt.CheckState.Checked)
     print(f"② 勾选完成：{win.lbl_selected.text()}")
 
+    win.input.setText(topic)  # 下载目录用隔离话题名（不影响已完成的搜索）
     win.do_download()
     # offscreen 模式下模态完成弹窗无人点击会卡住事件泵，测试时置为无操作
     from PySide6.QtWidgets import QMessageBox

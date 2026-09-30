@@ -11,6 +11,7 @@ python -m PyInstaller --noconfirm --onefile --windowed ^
   --icon assets\app.ico ^
   --add-data "assets\app.ico;assets" ^
   --name wechat-topic-searcher ^
+  --paths vendor --hidden-import wechat_scraper_v2 ^
   --hidden-import markdownify --hidden-import tqdm ^
   --hidden-import bs4 --hidden-import lxml ^
   --exclude-module torch --exclude-module torchvision --exclude-module torchaudio ^

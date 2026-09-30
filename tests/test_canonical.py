@@ -31,7 +31,7 @@ def main() -> int:
     assert "chksm=e93d5710" in out, "chksm 丢失"
     assert "mid=2247483750" in out and "sn=d7a2e106" in out
     assert "$" not in out and "window." not in out, "模板串未被跳过"
-    print("规范化解析逻辑验证通过 ✅（模板串跳过 + chksm 保留）")
+    print("规范化解析逻辑验证通过 OK（模板串跳过 + chksm 保留）")
     return 0
 
 

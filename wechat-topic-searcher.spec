@@ -3,10 +3,10 @@
 
 a = Analysis(
     ['app.py'],
-    pathex=[],
+    pathex=['vendor'],
     binaries=[],
     datas=[('assets/app.ico', 'assets')],
-    hiddenimports=['markdownify', 'tqdm', 'bs4', 'lxml'],
+    hiddenimports=['wechat_scraper_v2', 'markdownify', 'tqdm', 'bs4', 'lxml'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

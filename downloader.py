@@ -24,34 +24,60 @@ from typing import Callable, Optional
 
 import mdflatten
 
-APP_DIR = Path(__file__).resolve().parent
+# 打包（onefile）时 __file__ 位于临时解压目录：数据目录须跟随 exe 本体
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+
 DEFAULT_SKILL_DIR = Path(r"C:\Users\Administrator\.zcode\skills\wechat-link-downloads")
 
 _scraper = None  # 懒加载的 wechat_scraper_v2 模块
 _logger_inst = None
 
+# Windows 保留设备名（作目录名会出问题）
+_WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)
+}
+
 
 def _load_scraper():
+    """加载爬虫核心。
+
+    优先直接 import（打包时由 hidden-import 打进 PYZ；源码运行时 vendor/
+    或 skill 目录已在 sys.path 时同样直接命中），失败再回退到候选目录。
+    """
     global _scraper
     if _scraper is not None:
         return _scraper
-    env_dir = os.environ.get("WECHAT_SKILL_DIR")
-    candidates = []
-    if env_dir:
-        candidates.append(Path(env_dir))
-    candidates.append(APP_DIR / "vendor")  # 内置爬虫核心
-    for d in candidates:
-        if d.is_dir():
-            if str(d) not in sys.path:
-                sys.path.insert(0, str(d))
-            import wechat_scraper_v2  # noqa: E402
-
-            _scraper = wechat_scraper_v2
-            return _scraper
-    raise RuntimeError(
-        "未找到爬虫核心 wechat_scraper_v2.py（vendor/ 目录缺失，"
-        "或环境变量 WECHAT_SKILL_DIR 指向的目录不存在）"
-    )
+    m = None
+    try:
+        import wechat_scraper_v2 as m  # noqa: F401
+    except ImportError:
+        m = None
+    if m is None:
+        candidates = []
+        env_dir = os.environ.get("WECHAT_SKILL_DIR")
+        if env_dir:
+            candidates.append(Path(env_dir))
+        candidates.append(APP_DIR / "vendor")  # 内置爬虫核心
+        candidates.append(DEFAULT_SKILL_DIR)
+        for d in candidates:
+            if d.is_dir():
+                if str(d) not in sys.path:
+                    sys.path.insert(0, str(d))
+                try:
+                    import wechat_scraper_v2 as m  # noqa: F401
+                    break
+                except ImportError:
+                    m = None
+    if m is None:
+        raise RuntimeError(
+            "未找到爬虫核心 wechat_scraper_v2.py"
+            "（打包包体缺失或 vendor/ 与 WECHAT_SKILL_DIR 均不可用）"
+        )
+    _scraper = m
+    return _scraper
 
 
 def _logger():
@@ -70,7 +96,18 @@ def is_wechat_url(url: str) -> bool:
 
 
 def topic_dir(base_dir: str | os.PathLike, topic: str) -> Path:
-    return Path(base_dir).expanduser().resolve() / sanitize_topic(topic)
+    """话题 → 下载子目录（清洗 + 防目录逃逸）。"""
+    safe = sanitize_topic(topic)
+    stem = safe.split(".")[0].upper()
+    if not safe or safe in (".", "..") or stem in _WINDOWS_RESERVED:
+        safe = "未命名话题"
+    base = Path(base_dir).expanduser().resolve()
+    target = (base / safe).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as e:  # 清洗后仍逃出根目录（理论上不会发生），拒绝
+        raise ValueError(f"非法话题名：{topic!r}") from e
+    return target
 
 
 def download_articles(

@@ -40,11 +40,18 @@ import version
 from cache_store import Store
 
 APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # onefile 打包后 __file__ 在临时解压目录：配置/数据放 exe 旁（便携式），
+    # 只读资源（图标）在解压目录
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+else:
+    RESOURCE_DIR = APP_DIR
 CONFIG_PATH = APP_DIR / "config.json"
 DB_PATH = APP_DIR / "cache.db"
 
 DEFAULT_CONFIG = {
-    "base_dir": "G:/workbuddy/wechat_data/topic_search_downloads",
+    "base_dir": str(Path.home() / "Documents" / "wechat-topic-search"),
     "search_pages": 2,       # 每页 10 条；页数越多对搜狗请求越多
     "download_delay": 1.0,   # 文章间间隔秒数
     "cache_ttl_minutes": 30, # 搜索缓存有效期
@@ -76,9 +83,10 @@ class SearchWorker(QThread):
         self.pages, self.ttl_min, self.force = pages, ttl_min, force
 
     def run(self):
+        cache_key = f"{self.query}#p{self.pages}"  # 缓存键包含页数，配置变化不串缓存
         # 缓存命中 → 毫秒级返回
         if not self.force:
-            cached = self.store.get_cached_search(self.query, self.ttl_min * 60)
+            cached = self.store.get_cached_search(cache_key, self.ttl_min * 60)
             if cached:
                 self.done.emit(cached, f"缓存结果（{self.ttl_min:.0f} 分钟内，点「强制刷新」重新联网搜）")
                 return
@@ -90,7 +98,7 @@ class SearchWorker(QThread):
         except Exception as e:
             self.failed.emit(f"搜索失败：{e}")
             return
-        self.store.save_search(self.query, [r.to_dict() for r in results])
+        self.store.save_search(cache_key, [r.to_dict() for r in results])
         channel = results[0].channel if results else ""
         self.done.emit([r.to_dict() for r in results], f"联网搜索完成（通道：{channel}，共 {len(results)} 条）")
 
@@ -109,11 +117,12 @@ class DownloadWorker(QThread):
         self.topic, self.base_dir, self.delay = topic, base_dir, delay
 
     def run(self):
-        # 阶段 1：临时链接 → 规范文章地址（复用搜索会话 cookie）
+        # 阶段 1：真实地址直用（Bing/DDG 兜底结果），搜狗临时链接才解析
         resolved: list[tuple[SearchResult, str]] = []
         n_fail = 0
         for r in self.items:
-            if r.resolved and downloader.is_wechat_url(r.url):
+            if downloader.is_wechat_url(r.url):
+                r.resolved = True
                 resolved.append((r, r.url))
                 continue
             self.item_status.emit(r.sogou_link or r.url, "解析链接…", False)
@@ -128,11 +137,12 @@ class DownloadWorker(QThread):
             self.finished_all.emit(0, n_fail, "")
             return
 
-        # 阶段 2：进程内调用 skill 爬虫（顺序 + 逐篇回调）
+        # 阶段 2：进程内调用爬虫（顺序 + 逐篇回调）
         url2item = {real: r for r, real in resolved}
         real_urls = [real for _, real in resolved]
 
         def cb(idx: int, total: int, result: dict) -> None:
+            nonlocal n_fail
             self.batch_progress.emit(idx, total)
             u = (result.get("url") or "").split("#", 1)[0]
             item = url2item.get(u) or url2item.get(real_urls[idx - 1] if 0 < idx <= len(real_urls) else "")
@@ -226,12 +236,17 @@ class PreviewWorker(QThread):
                 real = r.url
             scraper = downloader._load_scraper()
             tmp = Path(tempfile.mkdtemp(prefix="wts_preview_"))
-            results = scraper.scrape_wechat(
-                urls=[real], delay=0,
-                images_dir=str(tmp / "images"), account_dir=str(tmp / "md"),
-            )
+            try:
+                results = scraper.scrape_wechat(
+                    urls=[real], delay=0,
+                    images_dir=str(tmp / "images"), account_dir=str(tmp / "md"),
+                )
+            except Exception as e:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
             r0 = results[0] if results else {}
             if not r0.get("success"):
+                shutil.rmtree(tmp, ignore_errors=True)  # 抓取失败即时清理临时目录
                 self.done.emit({"error": r0.get("error") or "抓取失败"})
                 return
             md_path = Path(r0.get("md_path") or "")
@@ -338,7 +353,7 @@ class MainWindow(QMainWindow):
 
     def _init_ui(self):
         self.setWindowTitle(f"{version.APP_NAME} v{version.__version__}")
-        icon_path = APP_DIR / "assets" / "app.ico"
+        icon_path = RESOURCE_DIR / "assets" / "app.ico"
         if icon_path.is_file():
             self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1060, 720)
@@ -470,9 +485,11 @@ class MainWindow(QMainWindow):
         if not query:
             self.lbl_status.setText("请输入话题关键词")
             return
-        if self.download_worker is not None:
-            QMessageBox.information(self, "下载中", "正在下载文章，请等下载完成后再搜索。")
+        if self.download_worker is not None or self.preview_worker is not None:
+            QMessageBox.information(self, "请稍候", "下载或预览进行中，完成后再搜索（共用网络会话）。")
             return
+        if self.search_worker is not None:
+            return  # 已有搜索在途（结果按 sender 校验，过期自动丢弃）
         self.btn_search.setEnabled(False)
         self.lbl_status.setText("搜索中…")
         self.search_worker = SearchWorker(
@@ -486,6 +503,9 @@ class MainWindow(QMainWindow):
         self.search_worker.start()
 
     def on_search_done(self, results: list, note: str):
+        if self.sender() is not self.search_worker:
+            return  # 过期结果（用户已发起新搜索），丢弃
+        self.search_worker = None
         self.btn_search.setEnabled(True)
         self.chk_force.setChecked(False)
         self._results = [
@@ -542,7 +562,7 @@ class MainWindow(QMainWindow):
 
         def sort_key(pair):
             r, local = pair
-            ai = self._ai_scores.get(rerank.key(r))
+            ai = self._ai_scores.get(rerank.key(r)) if self.chk_ai.isChecked() else None
             return (-ai if ai is not None else 1 << 30, -local)  # 有 AI 分的排前，按分数降序
 
         scored.sort(key=sort_key)
@@ -585,6 +605,8 @@ class MainWindow(QMainWindow):
             self.rerank_worker.start()
 
     def _on_rerank_done(self, scores: dict, note: str):
+        if self.sender() is not self.rerank_worker:
+            return  # 过期结果（属于上一次搜索的精排），丢弃
         self.rerank_worker = None
         if scores:
             self._ai_scores.update(scores)
@@ -592,6 +614,9 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(note)
 
     def on_search_failed(self, msg: str):
+        if self.sender() is not self.search_worker:
+            return  # 过期结果，丢弃
+        self.search_worker = None
         self.btn_search.setEnabled(True)
         self.lbl_status.setText(msg)
         if "验证码" in msg:
@@ -645,7 +670,8 @@ class MainWindow(QMainWindow):
 
     def _on_preview_done(self, info: dict):
         self.preview_worker = None
-        self.preview_dlg.tmp_dir = info.get("tmp")  # 关窗时统一清理
+        self.preview_dlg.cleanup_tmp()  # 清理上一篇预览的临时目录
+        self.preview_dlg.tmp_dir = info.get("tmp")
         self.preview_dlg.show_article(info)
         self.lbl_status.setText("就绪")
 
@@ -684,7 +710,7 @@ class MainWindow(QMainWindow):
         self.progress.setMaximum(len(items))
         self.lbl_status.setText(f"下载中：0/{len(items)} …")
         for r in items:
-            self._set_status_by_item(r, "排队中…")
+            self.on_item_status(r.sogou_link or r.url, "排队中…", False)
         self.download_worker = DownloadWorker(
             self.sogou, self.store, items, topic,
             self.cfg["base_dir"], float(self.cfg.get("download_delay", 1.0)),
@@ -693,14 +719,6 @@ class MainWindow(QMainWindow):
         self.download_worker.batch_progress.connect(self.on_batch_progress)
         self.download_worker.finished_all.connect(self.on_download_done)
         self.download_worker.start()
-
-    def _set_status_by_item(self, r: SearchResult, text: str, error: bool = False):
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            if item.data(0, Qt.UserRole) is r:
-                item.setText(4, text)
-                item.setForeground(4, Qt.red if error else Qt.darkGreen)
-                return
 
     def on_item_status(self, url: str, text: str, error: bool):
         for i in range(self.tree.topLevelItemCount()):
@@ -737,11 +755,35 @@ class MainWindow(QMainWindow):
         os.startfile(base)
 
     def closeEvent(self, event):
-        self.store.close()
+        # 通知后台线程收尾并短暂等待；等待不到就不关 SQLite（避免线程写已关库崩溃，
+        # 进程退出时由系统回收）
+        workers = [w for w in (
+            self.search_worker, self.download_worker,
+            self.rerank_worker, self.preview_worker,
+        ) if w is not None]
+        for w in workers:
+            w.requestInterruption()
+        for w in workers:
+            if w.isRunning():
+                w.wait(2000)
+        self.preview_dlg.cleanup_tmp()
+        if not any(w is not None and w.isRunning() for w in workers):
+            self.store.close()
         super().closeEvent(event)
 
 
 def main():
+    # 打包自检：验证爬虫核心在包体内可加载（不启动 GUI、不联网）
+    if "--selftest" in sys.argv:
+        try:
+            scraper = downloader._load_scraper()
+            assert hasattr(scraper, "scrape_wechat")
+            print("SELFTEST OK:", scraper.__name__)
+            return 0
+        except Exception as e:
+            print("SELFTEST FAIL:", e)
+            return 1
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     win = MainWindow()
@@ -755,4 +797,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
