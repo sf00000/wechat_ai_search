@@ -165,14 +165,22 @@ def test_fuse_no_retry() -> int:
     import downloader
 
     class FakeScraper:
+        """真实混合形态：第 1 篇 content_empty 触发熔断，其余 rate_limited_skip。"""
+
         def __init__(self):
             self.calls = []
 
         def scrape_wechat(self, urls, delay=0, images_dir="", account_dir="",
                           progress_callback=None):
             self.calls.append(list(urls))
-            return [{"url": u, "success": False, "error": "rate_limited_skip"}
-                    for u in urls]
+            out = []
+            for i, u in enumerate(urls):
+                if i == 0:
+                    out.append({"url": u, "success": False, "error": "content_empty",
+                                "_batch_circuit_break": True})
+                else:
+                    out.append({"url": u, "success": False, "error": "rate_limited_skip"})
+            return out
 
         def _sanitize_filename_part(self, s, max_len=60):
             return (s or "nodate").strip() or "nodate"
@@ -188,9 +196,10 @@ def test_fuse_no_retry() -> int:
             "熔断自测", os.path.join(os.environ["TEMP"], "wts_fuse"), retries=1)
     finally:
         downloader._scraper = None
-    assert len(fake.calls) == 1, f"熔断文章不应触发重试，实际调用 {len(fake.calls)} 次"
+    assert len(fake.calls) == 1, f"熔断批次不应触发重试，实际调用 {len(fake.calls)} 次"
+    assert s.get("circuit_broken") is True, "熔断标记应暴露给上层"
     assert len(s["failed"]) == 2 and s["written"] == 0
-    print("5. 熔断文章不重试 OK")
+    print("5. 熔断批次不重试 OK（真实混合形态：content_empty 触发 + rate_limited 跳过）")
 
 
 def test_per_article_cancel() -> int:
@@ -319,7 +328,8 @@ def test_mixed_circuit_break_stops_batch() -> int:
         }
 
     from PySide6.QtWidgets import QMessageBox
-    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    orig_box = QMessageBox.information
+    QMessageBox.information = staticmethod(lambda *a, **k: None)  # offscreen 弹窗无人点击会卡死
     app = QApplication.instance() or QApplication(sys.argv)
     orig = app_mod.downloader.download_articles
     app_mod.downloader.download_articles = fake_download
@@ -333,8 +343,14 @@ def test_mixed_circuit_break_stops_batch() -> int:
             if win.btn_search.isEnabled():
                 break
             time.sleep(0.05)
+        # 确保 worker 已结束（关闭路径依赖线程收尾，测试同样要收干净）
+        deadline2 = time.time() + 10
+        while win.download_worker is not None and time.time() < deadline2:
+            app.processEvents()
+            time.sleep(0.05)
     finally:
         app_mod.downloader.download_articles = orig
+        QMessageBox.information = orig_box  # 恢复全局弹窗函数，不污染后续测试
 
     assert calls["n"] == 1, f"熔断后应停止整批重试，实际调用 {calls['n']} 次"
     assert fake_sogou.refresh_n == 0, "熔断后不应重新解析任何文章"

@@ -26,7 +26,21 @@ def main() -> int:
     query = sys.argv[1] if len(sys.argv) > 1 else "AI 编程"
     topic = f"{query}_e2e{_t.strftime('%H%M%S')}"  # 仅下载目录带后缀，搜索词保持干净
     app = QApplication(sys.argv)
+    # offscreen 模式下模态弹窗无人点击会永久阻塞事件循环——覆盖搜索失败
+    # （验证码提示）与下载完成两条路径
+    from PySide6.QtWidgets import QMessageBox
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    QMessageBox.exec = staticmethod(lambda *a, **k: 0)
     win = MainWindow()
+    from PySide6.QtCore import QTimer
+    _wd = {"fired": False}
+
+    def _watchdog():
+        _wd["fired"] = True
+        print("E2E 看门狗：6 分钟未完成，强制退出（可能卡在模态弹窗或网络）")
+        app.quit()
+
+    QTimer.singleShot(360_000, _watchdog)
     win.input.setText(query)
     win.chk_force.setChecked(True)  # 强制联网，验证真实链路
 
@@ -54,9 +68,6 @@ def main() -> int:
 
     win.input.setText(topic)  # 下载目录用隔离话题名（不影响已完成的搜索）
     win.do_download()
-    # offscreen 模式下模态完成弹窗无人点击会卡住事件泵，测试时置为无操作
-    from PySide6.QtWidgets import QMessageBox
-    QMessageBox.information = staticmethod(lambda *a, **k: None)
     deadline = time.time() + 300
     while time.time() < deadline:
         app.processEvents()

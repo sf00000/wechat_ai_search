@@ -205,6 +205,10 @@ def download_articles(
         )
         retry_by_url = {r.get("url"): r for r in retry_results if isinstance(r, dict)}
         results = [retry_by_url.get(r.get("url"), r) for r in results]
+        # 重试轮也可能触发熔断：合并后重算标记，下一轮循环顶部即会停止
+        circuit_broken = circuit_broken or any(
+            isinstance(r, dict) and r.get("_batch_circuit_break") for r in retry_results
+        )
 
     # 缓存 → 扁平落盘（补缺 + 更新覆盖），与 skill CLI 行为一致
     mdflatten.flatten_cache(cache_root, root, logger)
