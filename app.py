@@ -1187,15 +1187,20 @@ def main():
     app.setFont(QFont("Microsoft YaHei UI", 10))
     win = MainWindow()
     win.show()
-    # 关闭 PyInstaller --splash 启动屏（仅 onefile+splash 打包时存在该模块）；
-    # 放在窗口显示之后，让启动屏覆盖整个解压与导入期
+    # 启动屏关闭放到独立守护线程：pyi_splash 的 Tcl 互操作在主线程调用
+    # 会引发原生崩溃（实测 v0.2.6），线程化后稳定
     if getattr(sys, "frozen", False):
-        try:
-            import pyi_splash  # type: ignore
+        import threading
 
-            pyi_splash.close()
-        except Exception:
-            pass
+        def _close_splash():
+            try:
+                import pyi_splash  # type: ignore
+
+                pyi_splash.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_close_splash, name="splash-close", daemon=True).start()
     # 命令行带话题词则自动搜索：python app.py "AI 编程"
     args = sys.argv[1:]
     if "--shot" in args:

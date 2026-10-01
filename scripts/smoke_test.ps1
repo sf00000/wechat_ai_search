@@ -11,7 +11,7 @@ while ((Get-Date) -lt $deadline) {
     $procs = Get-Process wechat-topic-searcher -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
         $p.Refresh()
-        if ($p.MainWindowTitle) { $title = $p.MainWindowTitle; break }
+        if ($p.MainWindowTitle -like '*微信话题搜索下载器*') { $title = $p.MainWindowTitle; break }
     }
     if ($title) { break }
 }
