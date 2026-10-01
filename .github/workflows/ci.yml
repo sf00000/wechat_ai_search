@@ -32,6 +32,7 @@ jobs:
           python tests/test_rerank.py
           python tests/test_canonical.py
           python tests/test_regressions.py
+          python tests/test_summary.py
 
       - name: Build exe (includes --selftest)
         shell: cmd

@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "base_dir": str(Path.home() / "Documents" / "wechat-topic-search"),
     "search_pages": 2,       # 每页 10 条；页数越多对搜狗请求越多
     "download_delay": 1.0,   # 文章间间隔秒数
+    "download_retries": 1,   # 瞬时失败自动重试轮数（微信模板摇摆）
     "cache_ttl_minutes": 30, # 搜索缓存有效期
     "ai_rerank": True,       # AI 语义精排（标题+摘要发模型网关打分）
     "rerank_model": "",      # 留空则用环境变量 WECHAT_CLASSIFY_MODEL 或默认模型
@@ -128,99 +129,135 @@ class SearchWorker(QThread):
 
 
 class DownloadWorker(QThread):
-    """后台下载：先解析搜狗临时链接，再复用 skill 爬虫逐篇抓取。"""
+    """后台下载：解析临时链接后逐篇抓取；失败轮换全新签名地址重试。"""
 
     item_status = Signal(str, str, bool)   # (url, 状态文本, 是否失败)
     batch_progress = Signal(int, int)      # (已完成, 总数)
     finished_all = Signal(int, int, str)   # (成功, 失败, 话题目录)
 
     def __init__(self, sogou: SogouWeixin, store: Store, items: list[SearchResult],
-                 topic: str, base_dir: str, delay: float, parent=None):
+                 topic: str, base_dir: str, delay: float, retries: int = 1, parent=None):
         super().__init__(parent)
         self.sogou, self.store, self.items = sogou, store, items
         self.topic, self.base_dir, self.delay = topic, base_dir, delay
+        self.retries = retries
 
     def run(self):
-        # 阶段 1：真实地址直用（Bing/DDG 兜底结果），搜狗临时链接才解析
-        resolved: list[tuple[SearchResult, str]] = []
+        total = len(self.items)
+        rounds = 1 + max(0, int(self.retries))
+        # remaining: [(SearchResult, 真实地址)] —— 每轮失败的项进入下一轮并重新解析
+        remaining: list[tuple[SearchResult, str]] = []
         n_fail = 0
+
+        # ---- 第 0 轮准备：解析搜狗临时链接（真实地址直用） ----
         for r in self.items:
             if self.isInterruptionRequested():
                 self.finished_all.emit(0, n_fail, "")
                 return
             if downloader.is_wechat_url(r.url):
-                r.resolved = True
-                resolved.append((r, r.url))
+                remaining.append((r, r.url))
                 continue
             self.item_status.emit(r.sogou_link or r.url, "解析链接…", False)
             try:
                 real = self.sogou.resolve(r)
-                resolved.append((r, real))
+                remaining.append((r, real))
             except Exception as e:
                 n_fail += 1
-                self.item_status.emit(r.sogou_link or r.url, f"✗ {e}", True)
+                self.item_status.emit(r.sogou_link or r.url, f"\u2717 {e}", True)
 
-        if not resolved:
+        if not remaining:
             self.finished_all.emit(0, n_fail, "")
             return
 
-        # 阶段 2：进程内调用爬虫（顺序 + 逐篇回调）
-        url2item = {real: r for r, real in resolved}
-        real_urls = [real for _, real in resolved]
-
-        def cb(idx: int, total: int, result: dict) -> None:
-            nonlocal n_fail
-            if self.isInterruptionRequested():
-                raise DownloadAborted()  # 经回调抛出，中断爬虫批次（不落半截 md）
-            self.batch_progress.emit(idx, total)
-            u = (result.get("url") or "").split("#", 1)[0]
-            item = url2item.get(u) or url2item.get(real_urls[idx - 1] if 0 < idx <= len(real_urls) else "")
-            if item is None:
-                return
-            # 回调字典只有 url/action/success/error
-            if result.get("success"):
-                if result.get("action") == "skip":
-                    self.item_status.emit(item.sogou_link or item.url, "✓ 已存在（增量跳过）", False)
-                else:
-                    self.item_status.emit(item.sogou_link or item.url, "✓ 已抓取", False)
-            else:
-                n_fail += 1
-                self.item_status.emit(
-                    item.sogou_link or item.url, f"✗ {result.get('error') or '抓取失败'}", True
-                )
-
-        try:
-            summary = downloader.download_articles(
-                real_urls, self.topic, self.base_dir,
-                delay=self.delay, progress_cb=cb,
-            )
-        except DownloadAborted:
-            self.finished_all.emit(0, 0, "")  # 窗口关闭触发的中止
-            return
-        except Exception as e:
-            for _, real in resolved:
-                self.item_status.emit(url2item[real].sogou_link or url2item[real].url, f"✗ {e}", True)
-            self.finished_all.emit(0, len(resolved), "")
-            return
-
-        # 阶段 3：落盘结果回填 + 写下载历史
+        # ---- 抓取轮：失败项下一轮换全新签名地址再试 ----
         n_ok = 0
-        md_by_url = {}
-        for ok_item in summary.get("ok", []):
-            md_by_url[ok_item["url"]] = ok_item
-        for r, real in resolved:
-            key = real.split("#", 1)[0]
-            info = md_by_url.get(key) or next(
-                (o for o in summary.get("ok", []) if o["url"] == key), None
-            )
-            if info and info.get("md_path"):
-                n_ok += 1
-                self.store.record_download(
-                    r.url or real, info.get("title") or r.title,
-                    info.get("author") or r.account, info["md_path"], self.topic,
+        topic_dir = ""
+        for attempt in range(rounds):
+            if self.isInterruptionRequested():
+                break
+            url2item = {real: r for r, real in remaining}
+            real_urls = [real for _, real in remaining]
+
+            def cb(idx: int, round_total: int, result: dict) -> None:
+                self.batch_progress.emit(n_ok + idx, n_ok + len(remaining))
+                u = (result.get("url") or "").split("#", 1)[0]
+                item = url2item.get(u)
+                if item is None:
+                    return
+                # 回调字典只有 url/action/success/error
+                if result.get("success"):
+                    if result.get("action") == "skip":
+                        self.item_status.emit(item.sogou_link or item.url, "\u2713 已存在（增量跳过）", False)
+                    else:
+                        self.item_status.emit(item.sogou_link or item.url, "\u2713 已抓取", False)
+                else:
+                    self.item_status.emit(
+                        item.sogou_link or item.url,
+                        f"\u2717 {result.get('error') or '抓取失败'}",
+                        True,
+                    )
+
+            try:
+                summary = downloader.download_articles(
+                    real_urls, self.topic, self.base_dir,
+                    delay=self.delay, retries=0, progress_cb=cb,
                 )
-                self.item_status.emit(r.sogou_link or r.url, f"✓ 已落盘", False)
-        self.finished_all.emit(n_ok, n_fail, summary.get("topic_dir", ""))
+            except DownloadAborted:
+                self.finished_all.emit(0, 0, "")
+                return
+            except Exception as e:
+                for _, real in remaining:
+                    self.item_status.emit(
+                        url2item[real].sogou_link or url2item[real].url, f"\u2717 {e}", True
+                    )
+                self.finished_all.emit(0, len(remaining), "")
+                return
+
+            topic_dir = summary.get("topic_dir", "")
+            ok_by_url = {o["url"]: o for o in summary.get("ok", [])}
+
+            still_failed: list[tuple[SearchResult, str, str]] = []
+            for r, real in remaining:
+                key = real.split("#", 1)[0]
+                info = ok_by_url.get(key)
+                if info and info.get("md_path"):
+                    n_ok += 1
+                    self.store.record_download(
+                        r.url or real, info.get("title") or r.title,
+                        info.get("author") or r.account, info["md_path"], self.topic,
+                    )
+                    self.item_status.emit(r.sogou_link or r.url, "\u2713 已落盘", False)
+                else:
+                    err = next(
+                        (f.get("error") or "抓取失败" for f in summary.get("failed", [])
+                         if f.get("url") == key),
+                        "抓取失败",
+                    )
+                    still_failed.append((r, real, err))
+
+            if not still_failed or attempt == rounds - 1:
+                n_fail = len(still_failed)
+                for r, real, err in still_failed:
+                    self.item_status.emit(r.sogou_link or r.url, f"\u2717 {err}", True)
+                break
+
+            # 重新解析失败项：签名地址可能已失效，换全新签名再试
+            for r, real, err in still_failed:
+                if self.isInterruptionRequested():
+                    break
+                self.item_status.emit(r.sogou_link or r.url, "重试中（换新链接）…", False)
+                try:
+                    self.sogou.resolve(r, refresh=True)
+                except Exception as e:
+                    self.item_status.emit(r.sogou_link or r.url, f"\u2717 {e}", True)
+            remaining = [
+                (r, r.url) for r, real, err in still_failed
+                if downloader.is_wechat_url(r.url)
+            ]
+            if not remaining:
+                break
+
+        self.finished_all.emit(n_ok, total - n_ok, topic_dir)
 
 
 class RerankWorker(QThread):
@@ -504,7 +541,8 @@ class MainWindow(QMainWindow):
         self.tree.setStyleSheet("QTreeWidget::item { height: 44px; }")
         self.tree.setMouseTracking(True)
         self.tree.viewport().setAttribute(Qt.WA_Hover, True)
-        self.tree.viewport().installEventFilter(self)
+        self.tree.viewport().installEventFilter(self)   # 鼠标/悬停事件发给 viewport
+        self.tree.installEventFilter(self)              # 键盘事件发给有焦点的 tree 本体
         header = self.tree.header()
         header.setSectionResizeMode(1, QHeaderView.Stretch)      # 标题独占剩余宽度
         self.tree.setColumnWidth(0, 44)
@@ -938,6 +976,7 @@ class MainWindow(QMainWindow):
         self.download_worker = DownloadWorker(
             self.sogou, self.store, items, topic,
             self.cfg["base_dir"], float(self.cfg.get("download_delay", 1.0)),
+            retries=int(self.cfg.get("download_retries", 1)),
         )
         self.download_worker.item_status.connect(self.on_item_status)
         self.download_worker.batch_progress.connect(self.on_batch_progress)
@@ -985,18 +1024,19 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, src, ev):
         """结果表：悬浮展示摘要卡；卡片可见未固定时截获 Tab 为「固定」。"""
-        if src is not self.tree.viewport():
-            return super().eventFilter(src, ev)
-
         t = ev.type()
         if (
             t == QEvent.KeyPress
             and ev.key() == Qt.Key_Tab
+            and src in (self.tree, self.tree.viewport())
             and self.summary_card.isVisible()
             and not self.summary_card.is_pinned()
         ):
             self.summary_card.pin()  # 焦点在结果表时的 Tab = 固定摘要卡
             return True
+
+        if src is not self.tree.viewport():
+            return super().eventFilter(src, ev)
 
         if not self._results:
             return super().eventFilter(src, ev)

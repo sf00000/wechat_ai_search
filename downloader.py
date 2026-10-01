@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -115,6 +116,7 @@ def download_articles(
     topic: str,
     base_dir: str,
     delay: float = 1.0,
+    retries: int = 1,
     resolve_link: Optional[Callable[[str], str]] = None,
     progress_cb: Optional[Callable[[int, int, dict], None]] = None,
 ) -> dict:
@@ -125,6 +127,7 @@ def download_articles(
         topic: 话题名（作为子目录）
         base_dir: 话题下载根目录
         delay: 文章间请求间隔秒数（对微信保持礼貌）
+        retries: 瞬时失败（模板摇摆/验证页）的自动重试轮数
         resolve_link: 可选，把临时链接解析为真实地址的回调
         progress_cb: (已完成数, 总数, 当篇结果 dict) —— 爬虫原生逐篇回调
 
@@ -173,6 +176,26 @@ def download_articles(
         account_dir=str(cache_root),
         progress_callback=progress_cb,
     )
+
+    # 瞬时失败自动重试：微信签名页在两种模板间摇摆（content_empty/验证页），
+    # 稍候重试一轮常能命中可抓取的模板。重试轮不再回调（避免进度回跳）。
+    retries = max(0, int(retries))
+    for rnd in range(retries):
+        # 注意：不能用 failed 命名（会遮蔽函数级失败列表，导致返回值混入原始失败字典）
+        retry_failed = [r for r in results if not r.get("success") and r.get("url")]
+        if not retry_failed:
+            break
+        retry_urls = [r["url"] for r in retry_failed]
+        logger.info("瞬时失败重试 | 第 %d 轮 | %d 个 URL", rnd + 1, len(retry_urls))
+        time.sleep(4 + 2 * rnd)
+        retry_results = scraper.scrape_wechat(
+            urls=retry_urls,
+            delay=delay + 1,
+            images_dir=str(images_dir),
+            account_dir=str(cache_root),
+        )
+        retry_by_url = {r.get("url"): r for r in retry_results if isinstance(r, dict)}
+        results = [retry_by_url.get(r.get("url"), r) for r in results]
 
     # 缓存 → 扁平落盘（补缺 + 更新覆盖），与 skill CLI 行为一致
     mdflatten.flatten_cache(cache_root, root, logger)

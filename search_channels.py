@@ -229,14 +229,14 @@ class SogouWeixin:
                 return cand.split("#", 1)[0]
         return None
 
-    def resolve(self, result: SearchResult) -> str:
+    def resolve(self, result: SearchResult, refresh: bool = False) -> str:
         """把搜狗临时链接解析为可直接抓取的文章地址（结果缓存在对象上）。
 
         拼接脚本给出的是带 signature 的临时地址（src=11 模板，正文由 JS 注入，
         直接抓会 content_empty），所以再请求一次，从页面里提取规范地址
         （mp.weixin.qq.com/s?__biz=...&mid=...&sn=...）。
         """
-        if result.resolved and result.url:
+        if not refresh and result.resolved and result.url:
             return result.url
         if not result.sogou_link:
             return ""

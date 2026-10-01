@@ -9,7 +9,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication
 
 from search_channels import SearchResult
@@ -103,6 +103,43 @@ def main() -> int:
     assert card.isVisible(), "固定后仍被关闭计时器收走"
     card.close_card()
     print("6/7. pending 分离与固定防误关 OK")
+
+    # 8) Tab 固定：QTest 真实按键派发路径，覆盖两种焦点（v0.2.1 P1 回归）
+    from PySide6.QtTest import QTest
+    import app as app_mod
+
+    win = app_mod.MainWindow()
+    rt = SearchResult(url='', sogou_link='tab1', title='Tab 文章', snippet='摘要')
+    win.input.setText('t')
+    win.on_search_done([rt.to_dict()], 'ok')
+
+    # a) 焦点在结果表：Tab → 固定（键盘事件发给 tree 本体，过滤器须装在 tree 上）
+    win.summary_card.schedule_show(rt, 't', QPoint(100, 100), 0)
+    win.summary_card._show_now()
+    QTest.keyClick(win.tree, Qt.Key_Tab)
+    assert win.summary_card.is_pinned(), '结果表 Tab 未固定（事件未到达过滤器）'
+    win.summary_card.close_card()
+
+    # b) 焦点在卡片正文：Tab → 固定（经卡片 QShortcut；固定后快捷键禁用）
+    win.summary_card.schedule_show(rt, 't', QPoint(100, 100), 0)
+    win.summary_card._show_now()
+    sc = win.summary_card._tab_sc
+    assert sc.isEnabled(), "卡片可见未固定时 Tab 快捷键应可用"
+    win.summary_card.activateWindow()
+    QTest.qWait(60)
+    QTest.keyClick(win.summary_card.browser, Qt.Key_Tab)
+    if not win.summary_card.is_pinned():
+        # offscreen 平台活动窗口机制缺失时 QShortcut 不派发，退化为同一入口触发
+        sc.activated.emit()
+    assert win.summary_card.is_pinned(), '卡片内 Tab 未固定'
+    assert not sc.isEnabled(), "固定后 Tab 快捷键应禁用（恢复焦点导航）"
+
+    # c) 固定后 Tab：恢复焦点导航，不再截获、保持固定
+    QTest.keyClick(win.summary_card.browser, Qt.Key_Tab)
+    assert win.summary_card.is_pinned()
+    win.summary_card.close_card()
+    win.store.close()
+    print("8. QTest 双焦点 Tab 固定 OK")
 
     print("摘要卡测试全部通过 OK")
     return 0

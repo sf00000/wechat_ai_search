@@ -2,6 +2,7 @@
   "base_dir": "",
   "search_pages": 2,
   "download_delay": 1.0,
+  "download_retries": 1,
   "cache_ttl_minutes": 30,
   "sogou_cookies": "",
   "ai_rerank": true,
