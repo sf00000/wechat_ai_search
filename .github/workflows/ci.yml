@@ -33,6 +33,7 @@ jobs:
           python tests/test_canonical.py
           python tests/test_regressions.py
           python tests/test_summary.py
+          python tests/test_window_interactions.py
 
       - name: Build exe (includes --selftest)
         shell: cmd

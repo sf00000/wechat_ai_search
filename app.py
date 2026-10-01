@@ -24,7 +24,7 @@ import tempfile
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QEvent, QUrl
+from PySide6.QtCore import QThread, Signal, Qt, QEvent, QPointF, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import (
@@ -241,10 +241,14 @@ class DownloadWorker(QThread):
                     self.item_status.emit(r.sogou_link or r.url, f"\u2717 {err}", True)
                 break
 
-            # 重新解析失败项：签名地址可能已失效，换全新签名再试
+            # 重新解析失败项：签名地址可能已失效，换全新签名再试。
+            # 被风控熔断（rate_limited）的文章尊重熔断结果，不再重新请求。
             for r, real, err in still_failed:
                 if self.isInterruptionRequested():
                     break
+                if err and "rate_limited" in err:
+                    self.item_status.emit(r.sogou_link or r.url, "\u2717 风控熔断跳过（稍后再试）", True)
+                    continue
                 self.item_status.emit(r.sogou_link or r.url, "重试中（换新链接）…", False)
                 try:
                     self.sogou.resolve(r, refresh=True)
@@ -440,13 +444,17 @@ class MainWindow(QMainWindow):
         self._sort_mode = "relevance"            # relevance / date_desc / date_asc
         self._closing = False
         self._hover_key: str | None = None
+        self._active_workers: set = set()        # 全部在途后台任务（原生 finished 时移除）
         self._init_ui()
         self._init_shortcuts()
 
     def _track_worker(self, w: QThread, attr: str):
         """线程原生 finished：清引用 + 关闭流程中触发收尾检查。"""
 
+        self._active_workers.add(w)
+
         def _finished():
+            self._active_workers.discard(w)
             if getattr(self, attr) is w:
                 setattr(self, attr, None)
             if self._closing:
@@ -478,6 +486,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.input, 1)
         bar.addWidget(self.chk_force)
         bar.addWidget(self.btn_search)
+        self.btn_always_on_top = QPushButton("窗口置顶")
+        self.btn_always_on_top.setCheckable(True)
+        self.btn_always_on_top.setToolTip("让主窗口保持在其他普通窗口前面；再次点击取消")
+        self.btn_always_on_top.toggled.connect(self._set_always_on_top)
+        bar.addWidget(self.btn_always_on_top)
         layout.addLayout(bar)
 
         # 选择行：全选（三态显示）/ 清空选择，只作用于当前展示的结果
@@ -540,6 +553,7 @@ class MainWindow(QMainWindow):
         self.tree.setEditTriggers(QTreeWidget.NoEditTriggers)
         self.tree.setStyleSheet("QTreeWidget::item { height: 44px; }")
         self.tree.setMouseTracking(True)
+        self.tree.viewport().setMouseTracking(True)
         self.tree.viewport().setAttribute(Qt.WA_Hover, True)
         self.tree.viewport().installEventFilter(self)   # 鼠标/悬停事件发给 viewport
         self.tree.installEventFilter(self)              # 键盘事件发给有焦点的 tree 本体
@@ -606,6 +620,8 @@ class MainWindow(QMainWindow):
         query = self.input.text().strip()
         if not query:
             self.lbl_status.setText("请输入话题关键词")
+            return
+        if self._closing:
             return
         if self.download_worker is not None or self.preview_worker is not None:
             QMessageBox.information(self, "请稍候", "下载或预览进行中，完成后再搜索（共用网络会话）。")
@@ -914,7 +930,7 @@ class MainWindow(QMainWindow):
 
     def start_preview(self, r: SearchResult):
         """应用内抓取正文并预览（窗口内渲染，含图片）。由双击/悬浮卡「查看正文」触发。"""
-        if r is None:
+        if r is None or self._closing:
             return
         if self.preview_worker is not None:
             return  # 已有预览在抓取
@@ -958,6 +974,8 @@ class MainWindow(QMainWindow):
             item.setCheckState(0, Qt.Checked)
 
     def do_download(self):
+        if self._closing:
+            return
         # 以勾选集合为源（含被筛选隐藏的选中项），数量与界面一致
         items = [
             self._results_by_key[k] for k in self._checked_keys if k in self._results_by_key
@@ -1022,6 +1040,15 @@ class MainWindow(QMainWindow):
         os.makedirs(base, exist_ok=True)
         os.startfile(base)
 
+    def _set_always_on_top(self, enabled: bool):
+        geometry = self.saveGeometry()
+        state = self.windowState()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
+        self.restoreGeometry(geometry)
+        self.setWindowState(state)
+        self.show()  # 修改原生窗口标志会隐藏窗口，需重新显示
+        self.btn_always_on_top.setText("已置顶 · 取消" if enabled else "窗口置顶")
+
     def eventFilter(self, src, ev):
         """结果表：悬浮展示摘要卡；卡片可见未固定时截获 Tab 为「固定」。"""
         t = ev.type()
@@ -1048,11 +1075,14 @@ class MainWindow(QMainWindow):
                 item = self.tree.topLevelItem(idx.row())
                 r = item.data(0, Qt.UserRole) if item is not None else None
             key = rerank.key(r) if r is not None else None
+            if r is not None:
+                self.summary_card.cancel_close()
             if r is not None and key != self._hover_key:
                 self._hover_key = key
                 self.summary_card.cancel_pending_show()
                 self.summary_card.schedule_show(
-                    r, self.input.text().strip(), QCursor.pos(), 180
+                    r, self.input.text().strip(),
+                    self.tree.viewport().mapToGlobal(ev.position().toPoint()), 180
                 )
             elif r is None and self._hover_key is not None:
                 self._hover_key = None
@@ -1067,19 +1097,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # 通知后台线程收尾并短暂等待；等不到就拦下关闭事件，
         # 由各线程原生 finished 触发 _try_finish_close 再真正关闭
-        self._closing = True
+        self._closing = True  # 关闭后禁止发起新任务
         self.summary_card.close_card()
-        workers = [w for w in (
-            self.search_worker, self.download_worker,
-            self.rerank_worker, self.preview_worker,
-        ) if w is not None]
-        for w in workers:
+        for w in list(self._active_workers):
             w.requestInterruption()
-        for w in workers:
+        for w in list(self._active_workers):
             if w.isRunning():
                 w.wait(2000)
         self.preview_dlg.cleanup_tmp()
-        if any(w is not None and w.isRunning() for w in workers):
+        if self._active_workers:
             event.ignore()
             self.lbl_status.setText("后台任务收尾中，完成后自动关闭…")
         else:
@@ -1087,20 +1113,36 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
 
     def _try_finish_close(self):
-        if not self._closing:
-            return
-        workers = [w for w in (
-            self.search_worker, self.download_worker,
-            self.rerank_worker, self.preview_worker,
-        ) if w is not None]
-        if any(w is not None and w.isRunning() for w in workers):
+        if not self._closing or self._active_workers:
             return
         self.preview_dlg.cleanup_tmp()
         self.store.close()
         self.close()
 
 
+def _install_crash_logger():
+    """打包版（--windowed）没有 stderr：未捕获异常追加写入 log/crash.log。"""
+    from datetime import datetime
+
+    log_dir = APP_DIR / "log"
+    prev_hook = sys.excepthook
+
+    def hook(t, v, tb):
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "crash.log", "a", encoding="utf-8") as f:
+                f.write(f"\n{datetime.now().isoformat()}\n")
+                import traceback
+                traceback.print_exception(t, v, tb, file=f)
+        except Exception:
+            pass
+        prev_hook(t, v, tb)
+
+    sys.excepthook = hook
+
+
 def main():
+    _install_crash_logger()
     # 打包自检：验证爬虫核心在包体内可加载（不启动 GUI、不联网）
     if "--selftest" in sys.argv:
         try:
@@ -1135,16 +1177,73 @@ def main():
         from PySide6.QtCore import QTimer
 
         def _capture():
+            # 从鼠标事件入口触发悬停（QTest.mouseMove 在部分平台不派发 hover 时，
+            # 退化为 sendEvent 同款鼠标事件——与交互测试一致，仍是事件入口路径）
+            if win.tree.topLevelItemCount() > 0:
+                from PySide6.QtGui import QMouseEvent
+                from PySide6.QtTest import QTest
+
+                viewport = win.tree.viewport()
+                rect = win.tree.visualItemRect(win.tree.topLevelItem(0))
+                QTest.mouseMove(viewport, rect.center(), 40)
+                ev = QMouseEvent(
+                    QEvent.MouseMove, QPointF(rect.center()),
+                    QPointF(viewport.mapToGlobal(rect.center())),
+                    Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+                )
+                QApplication.sendEvent(viewport, ev)
+            QTimer.singleShot(900, _save)
+
+        def _save():
+            print(f"[shot] card visible={card.isVisible()} pinned={card.is_pinned()} "
+                  f"pos={card.pos()} size={card.size()}")
+            img = win.grab().toImage()
+            card = win.summary_card
+            if card.isVisible():
+                # 悬浮卡是独立顶层窗口，单独抓取后按屏幕相对位置合成
+                pm = card.grab()
+                gp = card.mapToGlobal(QPoint(0, 0))
+                wp = win.mapToGlobal(QPoint(0, 0))
+                painter = QPainter(img)
+                painter.drawImage(QPoint(gp.x() - wp.x(), gp.y() - wp.y()), pm)
+                painter.end()
+            img.save(shot_path)
+            app.quit()
+
+        captured = {"done": False}
+
+        def _capture():
+            if captured["done"]:
+                return
+            captured["done"] = True
+            # 真实鼠标事件入口：悬停首行约一拍，让零网络摘要卡入镜
+            if win.tree.topLevelItemCount() > 0:
+                from PySide6.QtGui import QMouseEvent
+                from PySide6.QtTest import QTest
+
+                viewport = win.tree.viewport()
+                rect = win.tree.visualItemRect(win.tree.topLevelItem(0))
+                QTest.mouseMove(viewport, rect.center(), 40)
+                ev = QMouseEvent(
+                    QEvent.MouseMove, QPointF(rect.center()),
+                    QPointF(viewport.mapToGlobal(rect.center())),
+                    Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+                )
+                QApplication.sendEvent(viewport, ev)
+            QTimer.singleShot(900, _save)
+
+        def _save():
             win.grab().save(shot_path)
             app.quit()
 
         def _wait_search():
             if win.btn_search.isEnabled():  # 搜索完成（成功或失败）
-                QTimer.singleShot(900, _capture)  # 等布局稳定
+                QTimer.singleShot(900, _capture)
             else:
                 QTimer.singleShot(300, _wait_search)
 
         QTimer.singleShot(400, _wait_search)
+        QTimer.singleShot(20000, _capture)  # 看门狗：搜索再慢也按时出图
     sys.exit(app.exec())
 
 
