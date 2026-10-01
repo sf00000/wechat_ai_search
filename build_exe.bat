@@ -25,6 +25,15 @@ python -m PyInstaller --noconfirm --onefile --windowed ^
   app.py
 if errorlevel 1 goto :fail
 
+REM 构建产物守卫：site-packages 里某些包的可选依赖会拖入冲突运行库
+REM （icuuc/icudt 与 Qt6Core 冲突即 "DLL load failed"，torch 系则是体积爆炸）
+findstr /C:"icuuc" build\wechat-topic-searcher\PKG-00.toc >nul 2>&1
+if not errorlevel 1 goto :fail
+findstr /C:"icudt" build\wechat-topic-searcher\PKG-00.toc >nul 2>&1
+if not errorlevel 1 goto :fail
+findstr /C:"torch\lib" build\wechat-topic-searcher\PKG-00.toc >nul 2>&1
+if not errorlevel 1 goto :fail
+
 REM 打包后自检：验证爬虫核心在包体内可加载（打包缺陷在此即暴露）
 dist\wechat-topic-searcher.exe --selftest
 if errorlevel 1 goto :fail
