@@ -1187,6 +1187,15 @@ def main():
     app.setFont(QFont("Microsoft YaHei UI", 10))
     win = MainWindow()
     win.show()
+    # 关闭 PyInstaller --splash 启动屏（仅 onefile+splash 打包时存在该模块）；
+    # 放在窗口显示之后，让启动屏覆盖整个解压与导入期
+    if getattr(sys, "frozen", False):
+        try:
+            import pyi_splash  # type: ignore
+
+            pyi_splash.close()
+        except Exception:
+            pass
     # 命令行带话题词则自动搜索：python app.py "AI 编程"
     args = sys.argv[1:]
     if "--shot" in args:
