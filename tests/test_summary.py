@@ -141,6 +141,31 @@ def main() -> int:
     win.store.close()
     print("8. QTest 双焦点 Tab 固定 OK")
 
+    # 9) 卡片可见时成功生成合成截图（v0.2.4 P2 回归：drawPixmap/导入此前缺失）
+    import app as app_mod
+
+    win = app_mod.MainWindow()
+    card_host = win.summary_card
+    card_host.schedule_show(r1, "", QPoint(120, 120), 0)
+    card_host._show_now()
+    assert card_host.isVisible()
+
+    img = win.grab().toImage()
+    before = img.copy()
+    app_mod.compose_card_onto_image(win, img, card_host)
+    # 卡片中心像素应与合成前不同（证明卡片确实画上了）
+    gp = card_host.mapToGlobal(card_host.rect().center())
+    wp = win.mapToGlobal(QPoint(0, 0))
+    cx, cy = gp.x() - wp.x(), gp.y() - wp.y()
+    assert (0 <= cx < img.width() and 0 <= cy < img.height())
+    assert img.pixel(cx, cy) != before.pixel(cx, cy), "卡片未合成进截图"
+
+    out = Path(os.environ.get("TEMP", ".")) / "wts_compose_test.png"
+    assert img.save(str(out), "PNG") and out.exists() and out.stat().st_size > 0
+    out.unlink()
+    win.store.close()
+    print("9. 卡片可见时合成截图成功 OK")
+
     print("摘要卡测试全部通过 OK")
     return 0
 

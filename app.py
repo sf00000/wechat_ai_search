@@ -24,8 +24,8 @@ import tempfile
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt, QEvent, QPointF, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QThread, Signal, Qt, QEvent, QPointF, QPoint, QUrl
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView,
@@ -87,6 +87,16 @@ def load_config() -> dict:
         cfg["cache_ttl_minutes"] = 30
     cfg["ai_rerank"] = bool(cfg.get("ai_rerank", True))
     return cfg
+
+
+def compose_card_onto_image(win, img, card) -> None:
+    """把悬浮摘要卡（独立顶层窗口）合成进主窗口截图（img 上原地绘制）。"""
+    pm = card.grab()
+    gp = card.mapToGlobal(QPoint(0, 0))
+    wp = win.mapToGlobal(QPoint(0, 0))
+    painter = QPainter(img)
+    painter.drawPixmap(QPoint(gp.x() - wp.x(), gp.y() - wp.y()), pm)
+    painter.end()
 
 
 class DownloadAborted(Exception):
@@ -236,6 +246,15 @@ class DownloadWorker(QThread):
                         "抓取失败",
                     )
                     still_failed.append((r, real, err))
+
+            if summary.get("circuit_broken"):
+                # 批次已被风控熔断：本批失败项（含触发熔断的前几篇）不再自动重试
+                for r, real, err in still_failed:
+                    self.item_status.emit(
+                        r.sogou_link or r.url, "\u2717 风控熔断保护（稍后再试）", True
+                    )
+                self.finished_all.emit(n_ok, total - n_ok, topic_dir)
+                return
 
             if not still_failed or attempt == rounds - 1:
                 n_fail = len(still_failed)
@@ -1208,13 +1227,7 @@ def main():
             print(f"[shot] card visible={card.isVisible()} pinned={card.is_pinned()}")
             img = win.grab().toImage()
             if card.isVisible():
-                # 悬浮卡是独立顶层窗口，单独抓取后按屏幕相对位置合成
-                pm = card.grab()
-                gp = card.mapToGlobal(QPoint(0, 0))
-                wp = win.mapToGlobal(QPoint(0, 0))
-                painter = QPainter(img)
-                painter.drawImage(QPoint(gp.x() - wp.x(), gp.y() - wp.y()), pm)
-                painter.end()
+                compose_card_onto_image(win, img, card)
             img.save(shot_path)
             app.quit()
 

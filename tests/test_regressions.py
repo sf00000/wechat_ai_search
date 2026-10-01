@@ -227,21 +227,22 @@ def test_per_article_cancel() -> int:
     import time
 
     app = QApplication.instance() or QApplication(sys.argv)
-    w.start()  # 真实启动线程：requestInterruption 只对运行中的线程生效
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        app.processEvents()
-        if w.isFinished():
-            break
-        time.sleep(0.02)
-    for _ in range(5):  # 冲刷排队中的 finished_all 信号
-        app.processEvents()
-        time.sleep(0.02)
-    orig_restore = app_mod.downloader.download_articles
-    app_mod.downloader.download_articles = orig_restore
-    assert attempted == [r1.url], f"应只尝试第 1 篇，实际 {len(attempted)} 篇: {attempted}"
-    assert done and done[0][0] == 0 and done[0][1] == 0, done
-    print(f"6. 逐篇取消 OK（仅尝试 {len(attempted)}/2 篇即中止）")
+    try:
+        w.start()  # 真实启动线程：requestInterruption 只对运行中的线程生效
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            app.processEvents()
+            if w.isFinished():
+                break
+            time.sleep(0.02)
+        for _ in range(5):  # 冲刷排队中的 finished_all 信号
+            app.processEvents()
+            time.sleep(0.02)
+        assert attempted == [r1.url], f"应只尝试第 1 篇，实际 {len(attempted)} 篇: {attempted}"
+        assert done and done[0][0] == 0 and done[0][1] == 0, done
+        print(f"6. 逐篇取消 OK（仅尝试 {len(attempted)}/2 篇即中止）")
+    finally:
+        app_mod.downloader.download_articles = orig  # 恢复最初保存的函数
     return 0
 
 
@@ -268,6 +269,83 @@ def test_closing_blocks_new_tasks() -> int:
     return 0
 
 
+def test_mixed_circuit_break_stops_batch() -> int:
+    """真实混合批次：前几篇 content_empty 触发熔断、后续 rate_limited_skip。
+
+    熔断标记（_batch_circuit_break）必须传递到 worker：整批停止自动重试，
+    失败项不再重新解析（refresh 不得被调用）。
+    """
+    import app as app_mod
+
+    r1 = SearchResult(url="https://mp.weixin.qq.com/s?__biz=a", resolved=True)
+    r2 = SearchResult(url="https://mp.weixin.qq.com/s?__biz=b", resolved=True)
+
+    class FakeSogou:
+        def __init__(self):
+            self.refresh_n = 0
+
+        def resolve(self, r, refresh=False):
+            if refresh:
+                self.refresh_n += 1
+            return r.url
+
+    class FakeStore:
+        def record_download(self, *a, **k):
+            pass
+
+    win = app_mod.MainWindow()
+    fake_sogou = FakeSogou()
+    win.sogou = fake_sogou  # 注入假会话以统计 refresh 调用
+    win.input.setText("t")
+    win.on_search_done([r1.to_dict(), r2.to_dict()], "自测")
+    for i in range(2):
+        win.tree.topLevelItem(i).setCheckState(0, Qt.CheckState.Checked)
+
+    calls = {"n": 0}
+
+    def fake_download(urls, topic, base_dir, delay=0, retries=0, progress_cb=None, **k):
+        calls["n"] += 1
+        # 真实混合形态：第 1 篇 content_empty（触发熔断），第 2 篇 rate_limited_skip
+        return {
+            "topic_dir": ".",
+            "ok": [],
+            "failed": [
+                {"url": urls[0], "title": "t1", "error": "content_empty"},
+                {"url": urls[1], "title": "t2", "error": "rate_limited_skip"},
+            ],
+            "written": 0,
+            "skipped": 0,
+            "circuit_broken": True,
+        }
+
+    from PySide6.QtWidgets import QMessageBox
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    app = QApplication.instance() or QApplication(sys.argv)
+    orig = app_mod.downloader.download_articles
+    app_mod.downloader.download_articles = fake_download
+    try:
+        win.do_download()
+        import time
+
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            app.processEvents()
+            if win.btn_search.isEnabled():
+                break
+            time.sleep(0.05)
+    finally:
+        app_mod.downloader.download_articles = orig
+
+    assert calls["n"] == 1, f"熔断后应停止整批重试，实际调用 {calls['n']} 次"
+    assert fake_sogou.refresh_n == 0, "熔断后不应重新解析任何文章"
+    # 两篇都应标记为失败（✗）
+    statuses = [win.tree.topLevelItem(i).text(5) for i in range(2)]
+    assert all("✗" in s for s in statuses), statuses
+    win.store.close()
+    print(f"8. 混合熔断整批停止重试 OK（download 调用 {calls['n']} 次、refresh 0 次）")
+    return 0
+
+
 def main() -> int:
     test_fail_callback_no_unboundlocal()
     test_fallback_result_downloads_without_resolve()
@@ -276,6 +354,7 @@ def main() -> int:
     test_fuse_no_retry()
     test_per_article_cancel()
     test_closing_blocks_new_tasks()
+    test_mixed_circuit_break_stops_batch()
     print("回归测试全部通过 OK")
     return 0
 

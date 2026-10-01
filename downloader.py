@@ -179,8 +179,14 @@ def download_articles(
 
     # 瞬时失败自动重试：微信签名页在两种模板间摇摆（content_empty/验证页），
     # 稍候重试一轮常能命中可抓取的模板。重试轮不再回调（避免进度回跳）。
+    # 但批次触发风控熔断（_batch_circuit_break）时不重试——重试只会再次触发。
     retries = max(0, int(retries))
+    circuit_broken = any(
+        isinstance(r, dict) and r.get("_batch_circuit_break") for r in results
+    )
     for rnd in range(retries):
+        if circuit_broken:
+            break
         # 注意：不能用 failed 命名（会遮蔽函数级失败列表，导致返回值混入原始失败字典）
         retry_failed = [r for r in results if not r.get("success") and r.get("url")]
         retry_urls = [
@@ -243,4 +249,5 @@ def download_articles(
         "failed": failed,
         "written": written,
         "skipped": skipped,
+        "circuit_broken": circuit_broken,
     }
