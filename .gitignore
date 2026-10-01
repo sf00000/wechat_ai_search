@@ -9,6 +9,7 @@ dist/
 
 # 运行时生成
 log/
+images/  # 爬虫调试时落在项目目录的文章图片
 cache.db
 
 # 个人配置（含 cookie / 网关 token，绝不入库）
