@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from search_channels import SearchResult
@@ -159,11 +160,122 @@ def test_date_two_state_and_status_by_id() -> int:
     return 0
 
 
+def test_fuse_no_retry() -> int:
+    """被风控熔断（rate_limited）的文章不得进入重试轮。"""
+    import downloader
+
+    class FakeScraper:
+        def __init__(self):
+            self.calls = []
+
+        def scrape_wechat(self, urls, delay=0, images_dir="", account_dir="",
+                          progress_callback=None):
+            self.calls.append(list(urls))
+            return [{"url": u, "success": False, "error": "rate_limited_skip"}
+                    for u in urls]
+
+        def _sanitize_filename_part(self, s, max_len=60):
+            return (s or "nodate").strip() or "nodate"
+
+        def _is_wechat_host(self, url):
+            return "mp.weixin.qq.com" in url
+
+    fake = FakeScraper()
+    downloader._scraper = fake
+    try:
+        s = downloader.download_articles(
+            ["https://mp.weixin.qq.com/s?__biz=a", "https://mp.weixin.qq.com/s?__biz=b"],
+            "熔断自测", os.path.join(os.environ["TEMP"], "wts_fuse"), retries=1)
+    finally:
+        downloader._scraper = None
+    assert len(fake.calls) == 1, f"熔断文章不应触发重试，实际调用 {len(fake.calls)} 次"
+    assert len(s["failed"]) == 2 and s["written"] == 0
+    print("5. 熔断文章不重试 OK")
+
+
+def test_per_article_cancel() -> int:
+    """窗口关闭（中断请求）后，当前篇回调即中止，不再请求后续文章。"""
+    import app as app_mod
+
+    r1 = SearchResult(url="https://mp.weixin.qq.com/s?__biz=a", resolved=True)
+    r2 = SearchResult(url="https://mp.weixin.qq.com/s?__biz=b", resolved=True)
+
+    class FakeSogou:
+        def resolve(self, r):
+            return r.url
+
+    class FakeStore:
+        def record_download(self, *a, **k):
+            pass
+
+    w = app_mod.DownloadWorker(FakeSogou(), FakeStore(), [r1, r2], "t", ".", 0)
+    attempted = []
+
+    def fake_download(urls, topic, base_dir, delay=0, retries=0, progress_cb=None, **k):
+        for u in urls:  # 模拟爬虫逐篇抓取；cb 抛 DownloadAborted 即中断循环
+            attempted.append(u)
+            w.requestInterruption()  # 模拟第 1 篇抓取期间窗口关闭
+            progress_cb(len(attempted), len(urls),
+                        {"url": u, "action": "download", "success": False,
+                         "error": "content_empty"})
+        return {"topic_dir": ".", "ok": [], "failed": [], "written": 0, "skipped": 0}
+
+    orig = app_mod.downloader.download_articles
+    app_mod.downloader.download_articles = fake_download
+    done = []
+    w.finished_all.connect(lambda ok, fail, d: done.append((ok, fail, d)))
+    import time
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    w.start()  # 真实启动线程：requestInterruption 只对运行中的线程生效
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        app.processEvents()
+        if w.isFinished():
+            break
+        time.sleep(0.02)
+    for _ in range(5):  # 冲刷排队中的 finished_all 信号
+        app.processEvents()
+        time.sleep(0.02)
+    orig_restore = app_mod.downloader.download_articles
+    app_mod.downloader.download_articles = orig_restore
+    assert attempted == [r1.url], f"应只尝试第 1 篇，实际 {len(attempted)} 篇: {attempted}"
+    assert done and done[0][0] == 0 and done[0][1] == 0, done
+    print(f"6. 逐篇取消 OK（仅尝试 {len(attempted)}/2 篇即中止）")
+    return 0
+
+
+def test_closing_blocks_new_tasks() -> int:
+    """_closing 后：搜索/下载/预览都不再创建后台任务。"""
+    import app as app_mod
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = app_mod.MainWindow()
+    r = SearchResult(url="https://mp.weixin.qq.com/s?__biz=x", resolved=True, title="t")
+    win._closing = True
+    win.input.setText("t")
+    win.do_search()
+    assert win.search_worker is None, "关闭后不应启动搜索"
+    win._results = [r]
+    win._render_results()
+    win.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+    win.do_download()
+    assert win.download_worker is None, "关闭后不应启动下载"
+    win.start_preview(r)
+    assert win.preview_worker is None, "关闭后不应启动预览"
+    win.store.close()
+    print("7. 关闭期间不启动新任务 OK")
+    return 0
+
+
 def main() -> int:
     test_fail_callback_no_unboundlocal()
     test_fallback_result_downloads_without_resolve()
     test_stale_rerank_discarded()
     test_date_two_state_and_status_by_id()
+    test_fuse_no_retry()
+    test_per_article_cancel()
+    test_closing_blocks_new_tasks()
     print("回归测试全部通过 OK")
     return 0
 

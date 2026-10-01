@@ -179,6 +179,8 @@ class DownloadWorker(QThread):
             real_urls = [real for _, real in remaining]
 
             def cb(idx: int, round_total: int, result: dict) -> None:
+                if self.isInterruptionRequested():
+                    raise DownloadAborted()  # 逐篇取消：中止后不再请求后续文章
                 self.batch_progress.emit(n_ok + idx, n_ok + len(remaining))
                 u = (result.get("url") or "").split("#", 1)[0]
                 item = url2item.get(u)
@@ -257,6 +259,7 @@ class DownloadWorker(QThread):
             remaining = [
                 (r, r.url) for r, real, err in still_failed
                 if downloader.is_wechat_url(r.url)
+                and not (err and "rate_limited" in err)  # 熔断跳过的文章不再进入重试
             ]
             if not remaining:
                 break
@@ -663,6 +666,7 @@ class MainWindow(QMainWindow):
             self.chk_ai.isChecked()
             and self.chk_ai.isEnabled()
             and self._results
+            and not self._closing
         ):
             self.lbl_status.setText(note + "；AI 精排中…")
             self.rerank_worker = RerankWorker(
@@ -832,7 +836,7 @@ class MainWindow(QMainWindow):
         if not checked:
             self._render_results()  # 取消勾选：回退到规则排序（分数保留，取消勾选即忽略）
             return
-        if self._results and not self._ai_scores:
+        if self._results and not self._ai_scores and not self._closing:
             self.lbl_status.setText("AI 精排中…")
             self.rerank_worker = RerankWorker(
                 self.input.text().strip(), list(self._results),
@@ -1176,9 +1180,14 @@ def main():
     if shot_path:
         from PySide6.QtCore import QTimer
 
+        captured = {"done": False}
+
         def _capture():
-            # 从鼠标事件入口触发悬停（QTest.mouseMove 在部分平台不派发 hover 时，
-            # 退化为 sendEvent 同款鼠标事件——与交互测试一致，仍是事件入口路径）
+            if captured["done"]:
+                return
+            captured["done"] = True
+            # 真实鼠标事件入口触发悬停：QTest.mouseMove 在部分平台不派发 hover
+            # 时，退化为 sendEvent 同款鼠标事件（与交互测试一致的入口路径）
             if win.tree.topLevelItemCount() > 0:
                 from PySide6.QtGui import QMouseEvent
                 from PySide6.QtTest import QTest
@@ -1195,10 +1204,9 @@ def main():
             QTimer.singleShot(900, _save)
 
         def _save():
-            print(f"[shot] card visible={card.isVisible()} pinned={card.is_pinned()} "
-                  f"pos={card.pos()} size={card.size()}")
-            img = win.grab().toImage()
             card = win.summary_card
+            print(f"[shot] card visible={card.isVisible()} pinned={card.is_pinned()}")
+            img = win.grab().toImage()
             if card.isVisible():
                 # 悬浮卡是独立顶层窗口，单独抓取后按屏幕相对位置合成
                 pm = card.grab()
@@ -1208,32 +1216,6 @@ def main():
                 painter.drawImage(QPoint(gp.x() - wp.x(), gp.y() - wp.y()), pm)
                 painter.end()
             img.save(shot_path)
-            app.quit()
-
-        captured = {"done": False}
-
-        def _capture():
-            if captured["done"]:
-                return
-            captured["done"] = True
-            # 真实鼠标事件入口：悬停首行约一拍，让零网络摘要卡入镜
-            if win.tree.topLevelItemCount() > 0:
-                from PySide6.QtGui import QMouseEvent
-                from PySide6.QtTest import QTest
-
-                viewport = win.tree.viewport()
-                rect = win.tree.visualItemRect(win.tree.topLevelItem(0))
-                QTest.mouseMove(viewport, rect.center(), 40)
-                ev = QMouseEvent(
-                    QEvent.MouseMove, QPointF(rect.center()),
-                    QPointF(viewport.mapToGlobal(rect.center())),
-                    Qt.NoButton, Qt.NoButton, Qt.NoModifier,
-                )
-                QApplication.sendEvent(viewport, ev)
-            QTimer.singleShot(900, _save)
-
-        def _save():
-            win.grab().save(shot_path)
             app.quit()
 
         def _wait_search():

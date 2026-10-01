@@ -183,9 +183,12 @@ def download_articles(
     for rnd in range(retries):
         # 注意：不能用 failed 命名（会遮蔽函数级失败列表，导致返回值混入原始失败字典）
         retry_failed = [r for r in results if not r.get("success") and r.get("url")]
-        if not retry_failed:
+        retry_urls = [
+            r["url"] for r in retry_failed
+            if "rate_limited" not in str(r.get("error") or "")  # 尊重熔断结果
+        ]
+        if not retry_urls:
             break
-        retry_urls = [r["url"] for r in retry_failed]
         logger.info("瞬时失败重试 | 第 %d 轮 | %d 个 URL", rnd + 1, len(retry_urls))
         time.sleep(4 + 2 * rnd)
         retry_results = scraper.scrape_wechat(
